@@ -105,6 +105,7 @@ class StepResult:
     content: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
     error: Optional[str] = None
+    usage: Optional[Dict[str, int]] = None
 
 
 @dataclass
@@ -876,6 +877,10 @@ Please address this message and continue with your tasks.
                         and not result.content and not result.tool_calls):
                     empty_attempt += 1
                     if empty_attempt <= MAX_EMPTY_RETRIES:
+                        # Record usage for this empty attempt even though we are
+                        # about to retry – the provider may have already charged
+                        # for the tokens returned in this response.
+                        await self._record_usage_if_available(result.usage, message_id=assistant_msg.id)
                         delay_ms = SessionRetry.delay(empty_attempt)
                         next_retry_time = int(asyncio.get_event_loop().time() * 1000) + delay_ms
                         log.warn("runner.step.empty_response_retry", {
@@ -929,6 +934,7 @@ Please address this message and continue with your tasks.
                 # Success! Update finish reason
                 finish = "tool-calls" if result.tool_calls else "stop"
                 await Message.update(self.session.id, assistant_msg.id, finish=finish)
+                await self._record_usage_if_available(result.usage, message_id=assistant_msg.id)
                 
                 # Note: Compaction check is now done in the main loop (run()) before processing step
                 # This matches Flocks's logic: check lastFinished.tokens at loop start
@@ -1005,6 +1011,70 @@ Please address this message and continue with your tasks.
         
         # Aborted
         return StepResult(action="stop", error="Aborted")
+
+    @staticmethod
+    def _build_tokens_update(stream_usage: Optional[Dict[str, int]]) -> Optional[Dict[str, Any]]:
+        """Normalize runner token updates from provider usage."""
+        if not stream_usage:
+            return None
+        return {
+            "input": stream_usage.get("prompt_tokens", 0),
+            "output": stream_usage.get("completion_tokens", 0),
+            "reasoning": stream_usage.get("reasoning_tokens", 0),
+            "cache": {
+                "read": stream_usage.get("cache_read_input_tokens", 0),
+                "write": stream_usage.get("cache_creation_input_tokens", 0),
+            },
+        }
+
+    def _resolve_usage_pricing(self) -> Optional[Any]:
+        """Resolve pricing config for the current provider/model pair."""
+        from flocks.provider.usage_service import resolve_usage_pricing
+
+        return resolve_usage_pricing(self.provider_id, self.model_id)
+
+    async def _record_usage_if_available(
+        self,
+        usage: Optional[Dict[str, int]],
+        *,
+        message_id: Optional[str] = None,
+    ) -> None:
+        """Persist usage records without blocking successful session steps.
+
+        All exceptions – including ImportError when server routes are absent
+        in CLI-only environments – are caught here so that a usage-recording
+        failure can never corrupt an already-successful step result.
+
+        Uses the shared provider-layer usage service so that CLI and HTTP
+        callers rely on the same persistence and aggregation path.
+        """
+        if not usage:
+            return
+
+        try:
+            from flocks.provider.usage_service import RecordUsageRequest, record_usage
+
+            await record_usage(
+                RecordUsageRequest(
+                    provider_id=self.provider_id,
+                    model_id=self.model_id,
+                    session_id=self.session.id,
+                    message_id=message_id,
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    cached_tokens=usage.get("cache_read_input_tokens", 0),
+                    cache_write_tokens=usage.get("cache_creation_input_tokens", 0),
+                    reasoning_tokens=usage.get("reasoning_tokens", 0),
+                    pricing=self._resolve_usage_pricing(),
+                )
+            )
+        except Exception as exc:
+            log.warn("runner.usage_record_failed", {
+                "session_id": self.session.id,
+                "provider_id": self.provider_id,
+                "model_id": self.model_id,
+                "error": str(exc),
+            })
     
     async def _build_system_prompts(self, agent: AgentInfo) -> List[str]:
         """Build system prompts."""
@@ -1930,16 +2000,8 @@ Please address this message and continue with your tasks.
         reasoning = processor.get_reasoning_content()
         
         # Update message tokens if provider reported usage
-        if stream_usage:
-            tokens_update = {
-                "input": stream_usage.get("prompt_tokens", 0),
-                "output": stream_usage.get("completion_tokens", 0),
-                "reasoning": 0,
-                "cache": {
-                    "read": stream_usage.get("cache_read_input_tokens", 0),
-                    "write": stream_usage.get("cache_creation_input_tokens", 0),
-                },
-            }
+        tokens_update = self._build_tokens_update(stream_usage)
+        if tokens_update:
             try:
                 await Message.update(
                     self.session.id,
@@ -2007,6 +2069,7 @@ Please address this message and continue with your tasks.
                 action="continue",
                 content=content,
                 tool_calls=tool_calls_for_result,
+                usage=stream_usage,
             )
         
         self._end_observability(
@@ -2028,7 +2091,7 @@ Please address this message and continue with your tasks.
                 "finish_reason": processor.get_finish_reason(),
             },
         )
-        return StepResult(action="stop", content=content)
+        return StepResult(action="stop", content=content, usage=stream_usage)
     
     @staticmethod
     def _end_observability(
