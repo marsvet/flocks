@@ -22,11 +22,11 @@ export default function SessionPage() {
   // Capture params on mount only — avoids re-running when setSearchParams clears the URL.
   const initialSearchParamsRef = useRef(searchParams);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const isCreatingNewRef = useRef(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [selectedAgent, setSelectedAgent] = useState('rex');
   const [showAgentOptions, setShowAgentOptions] = useState(false);
   const [sseStatus, setSseStatus] = useState<SSEConnectionStatus>('disconnected');
+  const [creating, setCreating] = useState(false);
   const [pendingInitialMessage, setPendingInitialMessage] = useState<string | null>(null);
   const [selectMode, setSelectMode] = useState(false);
   const [checkedIds, setCheckedIds] = useState<Set<string>>(new Set());
@@ -76,9 +76,9 @@ export default function SessionPage() {
     }
   }, []);
 
-  // Auto select first session (skip when user intentionally started a new session)
+  // Auto select first session
   useEffect(() => {
-    if (!selectedSessionId && sessions.length > 0 && !isCreatingNewRef.current) {
+    if (!selectedSessionId && sessions.length > 0) {
       setSelectedSessionId(sessions[0].id);
     }
   }, [sessions, selectedSessionId]);
@@ -94,23 +94,28 @@ export default function SessionPage() {
     return () => document.removeEventListener('mousedown', handle);
   }, [showAgentOptions]);
 
-  const handleCreateSession = useCallback(() => {
-    isCreatingNewRef.current = true;
-    setSelectedSessionId(null);
-  }, []);
+  const handleCreateSession = useCallback(async () => {
+    if (creating) return;
+    setCreating(true);
+    try {
+      const response = await client.post('/api/session', { title: 'New Session' });
+      addSession(response.data);
+      setSelectedSessionId(response.data.id);
+    } catch (err: any) {
+      toast.error(t('createFailed'), err.message);
+    } finally {
+      setCreating(false);
+    }
+  }, [creating, addSession, toast, t]);
 
   const handleCreateAndSend = useCallback(async (text: string) => {
     try {
       const response = await client.post('/api/session', { title: 'New Session' });
       const newSessionId = response.data.id;
 
-      // Show the new session in the sidebar and switch to it immediately.
-      isCreatingNewRef.current = false;
       addSession(response.data);
       setSelectedSessionId(newSessionId);
 
-      // Fire-and-forget: prompt_async returns 202 instantly; no need to await.
-      // The response streams in via SSE once the backend picks it up.
       const payload: Record<string, unknown> = { parts: [{ type: 'text', text }] };
       if (selectedAgent) payload.agent = selectedAgent;
       client.post(`/api/session/${newSessionId}/prompt_async`, payload).catch((err: any) => {
@@ -238,9 +243,12 @@ export default function SessionPage() {
             <>
               <button
                 onClick={handleCreateSession}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-white border border-gray-200 text-gray-700 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-colors shadow-sm"
+                disabled={creating}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-white border border-gray-200 text-gray-700 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-colors disabled:opacity-60 disabled:cursor-not-allowed shadow-sm"
               >
-                <Plus className="w-5 h-5" />
+                {creating
+                  ? <Loader2 className="w-5 h-5 animate-spin" />
+                  : <Plus className="w-5 h-5" />}
                 <span className="font-medium">{t('newSession')}</span>
               </button>
               <button
@@ -264,7 +272,7 @@ export default function SessionPage() {
             sessions.map((session) => (
               <div
                 key={session.id}
-                onClick={() => { if (selectMode) { handleToggleCheck(session.id); } else { isCreatingNewRef.current = false; setSelectedSessionId(session.id); } }}
+                onClick={() => selectMode ? handleToggleCheck(session.id) : setSelectedSessionId(session.id)}
                 className={`group p-3 rounded-xl cursor-pointer transition-all duration-200 ${
                   !selectMode && selectedSessionId === session.id
                     ? 'bg-gray-100 border-2 border-gray-300 shadow-sm'
