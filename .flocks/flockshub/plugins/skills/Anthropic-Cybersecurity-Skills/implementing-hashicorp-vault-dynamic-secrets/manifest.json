@@ -7,7 +7,7 @@
   "version": "1.0",
   "author": "mahipal",
   "license": "Apache-2.0",
-  "homepage": "",
+  "homepage": "https://github.com/mukul975/Anthropic-Cybersecurity-Skills",
   "category": "threat-intel",
   "tags": [
     "iam",
@@ -57,5 +57,10 @@
   "entrypoints": [
     "SKILL.md"
   ],
-  "checksums": {}
+  "checksums": {},
+  "upstream": {
+    "name": "mukul975/Anthropic-Cybersecurity-Skills",
+    "url": "https://github.com/mukul975/Anthropic-Cybersecurity-Skills"
+  },
+  "sourceNotice": "Source: This skill is adapted from the open-source project https://github.com/mukul975/Anthropic-Cybersecurity-Skills."
 }
