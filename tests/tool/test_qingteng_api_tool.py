@@ -10,6 +10,9 @@ from flocks.tool.registry import ToolContext
 from flocks.tool.tool_loader import yaml_to_tool
 
 
+_QINGTENG_PLUGIN_DIR = "qingteng_v3_4_1_66"
+
+
 def _load_tool(yaml_name: str):
     yaml_path = (
         Path.cwd()
@@ -17,7 +20,7 @@ def _load_tool(yaml_name: str):
         / "plugins"
         / "tools"
         / "api"
-        / "qingteng"
+        / _QINGTENG_PLUGIN_DIR
         / yaml_name
     )
     raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
@@ -31,7 +34,7 @@ def _load_handler_module(script_name: str, module_name: str):
         / "plugins"
         / "tools"
         / "api"
-        / "qingteng"
+        / _QINGTENG_PLUGIN_DIR
         / script_name
     )
     spec = importlib.util.spec_from_file_location(module_name, str(script_path))
@@ -56,9 +59,10 @@ class _FakeHTTPConnection:
     responses: list["_FakeHTTPResponse"] = []
     created: list["_FakeHTTPConnection"] = []
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, **kwargs):
         self.host = host
         self.port = port
+        self.context = kwargs.get("context")
         self.calls: list[dict] = []
         _FakeHTTPConnection.created.append(self)
 
@@ -99,36 +103,44 @@ async def test_qingteng_assets_tool_and_handler_use_signed_sorted_query_params()
 
     module.get_secret_manager = lambda: mock_secret_manager
     module.httplib.HTTPConnection = _FakeHTTPConnection
-    module.time.time = lambda: 1700000000
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {}
+        module.time.time = lambda: 1700000000
 
-    result = await module.assets(
-        ToolContext(session_id="test", message_id="test"),
-        action="list",
-        resource="host",
-        os_type="linux",
-        page=0,
-        size=20,
-        sorts="-lastCheckTime",
-        groups="1,2",
-        keyword="srv",
-        businessGroupId="bg-1",
-    )
+        result = await module.assets(
+            ToolContext(session_id="test", message_id="test"),
+            action="list",
+            resource="host",
+            os_type="linux",
+            page=0,
+            size=20,
+            sorts="-lastCheckTime",
+            groups="1,2",
+            keyword="srv",
+            businessGroupId="bg-1",
+        )
 
-    assert tool.info.provider == "qingteng"
-    assert result.success is True
-    assert result.metadata["api"] == "assets.list"
-    assert result.output["total"] == 1
+        # ``info.provider`` is the storage key (service_id + version).
+        assert tool.info.provider == "qingteng_v3_4_1_66"
+        assert getattr(tool, "_service_id", None) == "qingteng"
+        assert result.success is True
+        assert result.metadata["api"] == "assets.list"
+        assert result.output["total"] == 1
 
-    query_call = _FakeHTTPConnection.created[1].calls[0]
-    assert query_call["method"] == "GET"
-    assert (
-        query_call["url"]
-        == "/external/api/assets/host/linux?page=0&size=20&sorts=-lastCheckTime&groups=1%2C2&keyword=srv&businessGroupId=bg-1"
-    )
+        query_call = _FakeHTTPConnection.created[1].calls[0]
+        assert query_call["method"] == "GET"
+        assert (
+            query_call["url"]
+            == "/external/api/assets/host/linux?page=0&size=20&sorts=-lastCheckTime&groups=1%2C2&keyword=srv&businessGroupId=bg-1"
+        )
 
-    raw_sign = "corp-1businessGroupIdbg-1groups1,2keywordsrvpage0size20sorts-lastCheckTime1700000000sign-1"
-    expected_sign = hashlib.sha1(raw_sign.encode("utf-8")).hexdigest()
-    assert query_call["headers"]["sign"] == expected_sign
+        raw_sign = "corp-1businessGroupIdbg-1groups1,2keywordsrvpage0size20sorts-lastCheckTime1700000000sign-1"
+        expected_sign = hashlib.sha1(raw_sign.encode("utf-8")).hexdigest()
+        assert query_call["headers"]["sign"] == expected_sign
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
 
 
 @pytest.mark.asyncio
@@ -222,6 +234,84 @@ async def test_qingteng_assets_reads_username_and_password_from_config_refs():
 
 
 @pytest.mark.asyncio
+async def test_qingteng_https_uses_unverified_context_when_verify_ssl_false():
+    module = _load_handler_module("qingteng.handler.py", "qingteng_https_ssl_false_test")
+    mock_secret_manager = _mock_secrets()
+
+    _FakeHTTPConnection.created = []
+    _FakeHTTPConnection.responses = [
+        _FakeHTTPResponse(
+            200,
+            {"success": True, "data": {"comId": "corp-1", "jwt": "jwt-1", "signKey": "sign-1"}},
+        ),
+        _FakeHTTPResponse(200, {"rows": [{"hostname": "srv-1"}], "total": 1}),
+    ]
+
+    module.get_secret_manager = lambda: mock_secret_manager
+    module.httplib.HTTPConnection = _FakeHTTPConnection
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {
+            "base_url": "https://qt.example.com:8443/openapi",
+            "verify_ssl": False,
+        } if service_id == "qingteng" else {}
+        module.time.time = lambda: 1700000000
+
+        result = await module.assets(
+            ToolContext(session_id="test", message_id="test"),
+            action="list",
+            resource="host",
+            os_type="linux",
+        )
+
+        assert result.success is True
+        assert _FakeHTTPConnection.created[0].context is not None
+        assert _FakeHTTPConnection.created[1].context is not None
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
+
+
+@pytest.mark.asyncio
+async def test_qingteng_https_uses_default_context_when_verify_ssl_true():
+    module = _load_handler_module("qingteng.handler.py", "qingteng_https_ssl_true_test")
+    mock_secret_manager = _mock_secrets()
+
+    _FakeHTTPConnection.created = []
+    _FakeHTTPConnection.responses = [
+        _FakeHTTPResponse(
+            200,
+            {"success": True, "data": {"comId": "corp-1", "jwt": "jwt-1", "signKey": "sign-1"}},
+        ),
+        _FakeHTTPResponse(200, {"rows": [{"hostname": "srv-1"}], "total": 1}),
+    ]
+
+    module.get_secret_manager = lambda: mock_secret_manager
+    module.httplib.HTTPConnection = _FakeHTTPConnection
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {
+            "base_url": "https://qt.example.com:8443/openapi",
+            "verify_ssl": True,
+        } if service_id == "qingteng" else {}
+        module.time.time = lambda: 1700000000
+
+        result = await module.assets(
+            ToolContext(session_id="test", message_id="test"),
+            action="list",
+            resource="host",
+            os_type="linux",
+        )
+
+        assert result.success is True
+        assert _FakeHTTPConnection.created[0].context is None
+        assert _FakeHTTPConnection.created[1].context is None
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
+
+
+@pytest.mark.asyncio
 async def test_qingteng_assets_process_query_only_uses_process_fields():
     module = _load_handler_module("qingteng.handler.py", "qingteng_assets_process_handler_test")
     mock_secret_manager = _mock_secrets()
@@ -237,27 +327,33 @@ async def test_qingteng_assets_process_query_only_uses_process_fields():
 
     module.get_secret_manager = lambda: mock_secret_manager
     module.httplib.HTTPConnection = _FakeHTTPConnection
-    module.time.time = lambda: 1700000000
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {}
+        module.time.time = lambda: 1700000000
 
-    result = await module.assets(
-        ToolContext(session_id="test", message_id="test"),
-        action="list",
-        resource="process",
-        os_type="linux",
-        page=0,
-        size=20,
-        processName="sshd",
-        processPath="/usr/sbin/sshd",
-        processPid=1234,
-    )
+        result = await module.assets(
+            ToolContext(session_id="test", message_id="test"),
+            action="list",
+            resource="process",
+            os_type="linux",
+            page=0,
+            size=20,
+            processName="sshd",
+            processPath="/usr/sbin/sshd",
+            processPid=1234,
+        )
 
-    assert result.success is True
+        assert result.success is True
 
-    query_call = _FakeHTTPConnection.created[1].calls[0]
-    assert (
-        query_call["url"]
-        == "/external/api/assets/process/linux?page=0&size=20&processName=sshd&processPath=%2Fusr%2Fsbin%2Fsshd&processPid=1234"
-    )
+        query_call = _FakeHTTPConnection.created[1].calls[0]
+        assert (
+            query_call["url"]
+            == "/external/api/assets/process/linux?page=0&size=20&processName=sshd&processPath=%2Fusr%2Fsbin%2Fsshd&processPid=1234"
+        )
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
 
 
 @pytest.mark.asyncio
@@ -293,29 +389,35 @@ async def test_qingteng_risk_patch_list_uses_refined_query_fields():
 
     module.get_secret_manager = lambda: mock_secret_manager
     module.httplib.HTTPConnection = _FakeHTTPConnection
-    module.time.time = lambda: 1700000000
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {}
+        module.time.time = lambda: 1700000000
 
-    result = await module.risk(
-        ToolContext(session_id="test", message_id="test"),
-        action="patch_list",
-        os_type="linux",
-        page=0,
-        size=10,
-        severity="high",
-        status="unfixed",
-        hostId="host-1",
-        patch_name="openssl",
-        cve="CVE-2024-0001",
-        groups="10,11",
-    )
+        result = await module.risk(
+            ToolContext(session_id="test", message_id="test"),
+            action="patch_list",
+            os_type="linux",
+            page=0,
+            size=10,
+            severity="high",
+            status="unfixed",
+            hostId="host-1",
+            patch_name="openssl",
+            cve="CVE-2024-0001",
+            groups="10,11",
+        )
 
-    assert result.success is True
+        assert result.success is True
 
-    query_call = _FakeHTTPConnection.created[1].calls[0]
-    assert (
-        query_call["url"]
-        == "/external/api/vul/patch/linux/list?page=0&size=10&severity=high&status=unfixed&hostId=host-1&groups=10%2C11&patch_name=openssl&cve=CVE-2024-0001"
-    )
+        query_call = _FakeHTTPConnection.created[1].calls[0]
+        assert (
+            query_call["url"]
+            == "/external/api/vul/patch/linux/list?page=0&size=10&severity=high&status=unfixed&hostId=host-1&groups=10%2C11&patch_name=openssl&cve=CVE-2024-0001"
+        )
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
 
 
 @pytest.mark.asyncio
@@ -350,25 +452,31 @@ async def test_qingteng_risk_weakpwd_list_uses_account_specific_field():
 
     module.get_secret_manager = lambda: mock_secret_manager
     module.httplib.HTTPConnection = _FakeHTTPConnection
-    module.time.time = lambda: 1700000000
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {}
+        module.time.time = lambda: 1700000000
 
-    result = await module.risk(
-        ToolContext(session_id="test", message_id="test"),
-        action="weakpwd_list",
-        os_type="linux",
-        page=0,
-        size=10,
-        accountName="root",
-        severity="critical",
-    )
+        result = await module.risk(
+            ToolContext(session_id="test", message_id="test"),
+            action="weakpwd_list",
+            os_type="linux",
+            page=0,
+            size=10,
+            accountName="root",
+            severity="critical",
+        )
 
-    assert result.success is True
+        assert result.success is True
 
-    query_call = _FakeHTTPConnection.created[1].calls[0]
-    assert (
-        query_call["url"]
-        == "/external/api/vul/weakpwd/linux/list?page=0&size=10&severity=critical&accountName=root"
-    )
+        query_call = _FakeHTTPConnection.created[1].calls[0]
+        assert (
+            query_call["url"]
+            == "/external/api/vul/weakpwd/linux/list?page=0&size=10&severity=critical&accountName=root"
+        )
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
 
 
 @pytest.mark.asyncio
@@ -387,27 +495,33 @@ async def test_qingteng_detect_brutecrack_list_uses_time_range_filters():
 
     module.get_secret_manager = lambda: mock_secret_manager
     module.httplib.HTTPConnection = _FakeHTTPConnection
-    module.time.time = lambda: 1700000000
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {}
+        module.time.time = lambda: 1700000000
 
-    result = await module.detect(
-        ToolContext(session_id="test", message_id="test"),
-        action="brutecrack_list",
-        os_type="win",
-        page=1,
-        size=50,
-        ip="1.1.1.1",
-        account="admin",
-        begin_time="2025-01-01 00:00:00",
-        end_time="2025-01-02 00:00:00",
-    )
+        result = await module.detect(
+            ToolContext(session_id="test", message_id="test"),
+            action="brutecrack_list",
+            os_type="win",
+            page=1,
+            size=50,
+            ip="1.1.1.1",
+            account="admin",
+            begin_time="2025-01-01 00:00:00",
+            end_time="2025-01-02 00:00:00",
+        )
 
-    assert result.success is True
+        assert result.success is True
 
-    query_call = _FakeHTTPConnection.created[1].calls[0]
-    assert (
-        query_call["url"]
-        == "/external/api/detect/brutecrack/win?page=1&size=50&ip=1.1.1.1&account=admin&begin_time=2025-01-01+00%3A00%3A00&end_time=2025-01-02+00%3A00%3A00"
-    )
+        query_call = _FakeHTTPConnection.created[1].calls[0]
+        assert (
+            query_call["url"]
+            == "/external/api/detect/brutecrack/win?page=1&size=50&ip=1.1.1.1&account=admin&begin_time=2025-01-01+00%3A00%3A00&end_time=2025-01-02+00%3A00%3A00"
+        )
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
 
 
 @pytest.mark.asyncio
@@ -442,25 +556,31 @@ async def test_qingteng_detect_honeypot_rule_update_uses_put_and_body_signature(
 
     module.get_secret_manager = lambda: mock_secret_manager
     module.httplib.HTTPConnection = _FakeHTTPConnection
-    module.time.time = lambda: 1700000000
+    module.httplib.HTTPSConnection = _FakeHTTPConnection
+    original_get_api_service_raw = module.ConfigWriter.get_api_service_raw
+    try:
+        module.ConfigWriter.get_api_service_raw = lambda service_id: {}
+        module.time.time = lambda: 1700000000
 
-    result = await module.detect(
-        ToolContext(session_id="test", message_id="test"),
-        action="honeypot_rule_update",
-        os_type="win",
-        id="rule-1",
-        enabled=True,
-        name="demo-rule",
-        port=8080,
-        protocol="tcp",
-    )
+        result = await module.detect(
+            ToolContext(session_id="test", message_id="test"),
+            action="honeypot_rule_update",
+            os_type="win",
+            id="rule-1",
+            enabled=True,
+            name="demo-rule",
+            port=8080,
+            protocol="tcp",
+        )
 
-    assert result.success is True
-    assert result.output == {"updated": True}
+        assert result.success is True
+        assert result.output == {"updated": True}
 
-    put_call = _FakeHTTPConnection.created[1].calls[0]
-    assert put_call["method"] == "PUT"
-    assert put_call["url"] == "/external/api/detect/honeypot/win/rule"
+        put_call = _FakeHTTPConnection.created[1].calls[0]
+        assert put_call["method"] == "PUT"
+        assert put_call["url"] == "/external/api/detect/honeypot/win/rule"
+    finally:
+        module.ConfigWriter.get_api_service_raw = original_get_api_service_raw
     assert put_call["body"] == '{"id":"rule-1","name":"demo-rule","port":8080,"protocol":"tcp","enabled":true}'
 
     raw_sign = 'corp-1{"id":"rule-1","name":"demo-rule","port":8080,"protocol":"tcp","enabled":true}1700000000sign-1'
@@ -540,7 +660,7 @@ async def test_qingteng_system_audit_uses_shared_handler_logic():
         sorts="-eventTime",
     )
 
-    assert tool.info.provider == "qingteng"
+    assert tool.info.provider == "qingteng_v3_4_1_66"
     assert result.success is True
     assert result.metadata["api"] == "system.audit"
     assert result.output["total"] == 1

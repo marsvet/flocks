@@ -6,6 +6,7 @@ Main HTTP API server for AI-Native SecOps Platform
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -82,6 +83,18 @@ async def lifespan(app: FastAPI):
         log.info("config.files.checked")
     except Exception as e:
         log.warning("config.files.check_failed", {"error": str(e)})
+
+    # Migrate ``api_services`` blocks to versioned storage keys. Idempotent:
+    # cheap re-run on every startup, copies legacy ``service_id`` entries to
+    # ``<service_id>_v<version>`` once the plugin declares a version.
+    try:
+        from flocks.config.api_versioning import migrate_api_services
+        actions = migrate_api_services()
+        copied = [k for k, v in actions.items() if v == "copied"]
+        if copied:
+            log.info("config.api_services.migrated", {"copied": copied})
+    except Exception as e:
+        log.warning("config.api_services.migrate_failed", {"error": str(e)})
     
     # Initialize storage
     await Storage.init()
@@ -317,6 +330,35 @@ app = FastAPI(
 log = Log.create(service="server")
 
 
+_REQUEST_LOG_SKIP_EXACT = frozenset({
+    "/health",
+    "/api/health",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+    "/api/event",
+    "/api/session/status",
+})
+
+
+def _is_noisy_request_path(path: str) -> bool:
+    """Return True for high-frequency polling endpoints that are noisy on success."""
+    if path in _REQUEST_LOG_SKIP_EXACT:
+        return True
+    if path.startswith("/api/session/") and path.endswith("/message"):
+        return True
+    if path.startswith("/api/question/session/") and path.endswith("/pending"):
+        return True
+    return False
+
+
+def _should_log_request(path: str, status_code: int) -> bool:
+    """Keep abnormal responses visible while suppressing successful polling noise."""
+    if status_code >= 400:
+        return True
+    return not _is_noisy_request_path(path)
+
+
 # CORS Configuration
 #
 # Priority order:
@@ -481,33 +523,31 @@ async def instance_context_middleware(request: Request, call_next):
 # Request Logging Middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming requests"""
-    # Skip logging for certain paths
-    skip_paths = {"/health", "/docs", "/redoc", "/openapi.json"}
-    
-    if request.url.path not in skip_paths:
-        log.info("request.start", {
-            "method": request.method,
-            "path": request.url.path,
-            "client": request.client.host if request.client else None,
-        })
-    
-    # Time the request
-    timer = log.time("request.complete", {
-        "method": request.method,
-        "path": request.url.path,
-    })
-    
-    with timer:
+    """Log one completion line for useful requests; suppress successful polling noise."""
+    path = request.url.path
+    started_at = time.monotonic()
+
+    try:
         response = await call_next(request)
-    
-    if request.url.path not in skip_paths:
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        log.error("request.error", {
+            "method": request.method,
+            "path": path,
+            "duration": duration_ms,
+            "error": str(exc),
+        })
+        raise
+
+    if _should_log_request(path, response.status_code):
+        duration_ms = int((time.monotonic() - started_at) * 1000)
         log.info("request.complete", {
             "method": request.method,
-            "path": request.url.path,
+            "path": path,
             "status": response.status_code,
+            "duration": duration_ms,
         })
-    
+
     return response
 
 
@@ -634,6 +674,7 @@ from flocks.server.routes.tui import router as tui_router
 from flocks.server.routes.workflow import router as workflow_router
 # WebUI: Skill & Command routes
 from flocks.server.routes.skill import router as skill_router
+from flocks.server.routes.hub import router as hub_router
 # WebUI: Hook management routes
 from flocks.server.routes.hooks import router as hooks_router
 # Model management: Default model, Usage routes
@@ -656,6 +697,7 @@ from flocks.server.routes.update import router as update_router
 from flocks.server.routes.logs import router as logs_router
 from flocks.server.routes.auth import router as auth_router
 from flocks.server.routes.admin_users import router as admin_users_router
+from flocks.server.routes.notifications import router as notifications_router
 # Original routes with /api/ prefix
 app.include_router(health_router, prefix="/api", tags=["Health"])
 app.include_router(session_router, prefix="/api/session", tags=["Session"])
@@ -679,6 +721,8 @@ app.include_router(mcp_router, prefix="/api/mcp", tags=["MCP"])
 app.include_router(workflow_router, prefix="/api", tags=["Workflow"])
 # WebUI: Skill & Command routes
 app.include_router(skill_router, prefix="/api", tags=["Skill"])
+# WebUI: Hub routes
+app.include_router(hub_router, prefix="/api", tags=["Hub"])
 # WebUI: Hook management routes
 app.include_router(hooks_router, prefix="/api/hooks", tags=["Hooks"])
 # Model management: Default model routes
@@ -708,6 +752,7 @@ app.include_router(update_router, prefix="/api/update", tags=["Update"])
 app.include_router(logs_router, prefix="/api/logs", tags=["Logs"])
 app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
 app.include_router(admin_users_router, prefix="/api/admin", tags=["Admin"])
+app.include_router(notifications_router, prefix="/api/notifications", tags=["Notifications"])
 
 # ============================================================
 # TUI Compatible Routes (without /api/ prefix)
