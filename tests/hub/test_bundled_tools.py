@@ -266,15 +266,41 @@ class TestResolveInstallDestination:
         assert dst.parent.name == "skills"
         assert dst.name == "demo-skill"
 
-    def test_tool_from_external_path_uses_default_layout(self, isolated_hub, tmp_path):
-        # Source is OUTSIDE flockshub → can't infer a group → fall back
-        # to the default ``<plugins>/tools/<id>/`` shape.
+    def test_tool_from_external_path_without_group_uses_default_layout(self, isolated_hub, tmp_path):
+        # Source's parent name (``external``) isn't a recognised group
+        # → no prefix to preserve → fall back to ``<plugins>/tools/<id>/``.
         external = tmp_path / "external" / "weird-tool"
         external.mkdir(parents=True)
         dst = _resolve_install_destination("tool", "weird-tool", external, "global")
         assert dst.name == "weird-tool"
-        # Default layout: directly under ``tools/`` (no group dir).
         assert dst.parent.name == "tools"
+
+    def test_tool_from_project_level_api_dir_preserves_subdir(self, isolated_hub):
+        """Re-installing a project-level API plugin into the user scope must
+        also keep the ``api/`` subdir.
+
+        Regression for the case where the FlocksHub catalog surfaces a
+        project-level plugin (``<cwd>/.flocks/plugins/tools/api/<id>/``)
+        as installable: dropping the group prefix here landed the copy at
+        ``~/.flocks/plugins/tools/<id>/`` and silently broke
+        ``api_versioning``'s ``_provider.yaml`` discovery.
+        """
+        src = (
+            isolated_hub["project"]
+            / ".flocks"
+            / "plugins"
+            / "tools"
+            / "api"
+            / "onesig_v2_5_3_D20260321"
+        )
+        src.mkdir(parents=True)
+        (src / "_provider.yaml").write_text(
+            "name: onesig\nservice_id: onesig_api\nversion: '2.5.3 D20260321'\n",
+            encoding="utf-8",
+        )
+        dst = _resolve_install_destination("tool", "onesig_v2_5_3_D20260321", src, "global")
+        assert dst.parent.name == "api"
+        assert dst.name == "onesig_v2_5_3_D20260321"
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +333,68 @@ class TestBundledInstallFlow:
         # on disk in flockshub.
         available_entries = catalog.list_catalog(plugin_type="tool", state=["available"])
         assert any(e.id == "onesig_v2_5_3_D20250710" for e in available_entries)
+
+    async def test_uninstall_cleans_orphan_api_service_entry(self, isolated_hub):
+        """Flockshub uninstall must drop the bootstrapped api_services
+        block too — otherwise the api-services UI would keep showing a
+        stale entry pointing at a plugin the user just removed.
+        """
+        from flocks.config.config_writer import ConfigWriter
+
+        _write_bundled_tool(
+            isolated_hub["bundled"],
+            plugin_id="onesig_v2_5_3_D20250710",
+            service_id="onesig_api",
+            version="2.5.3 D20250710",
+        )
+        await install_plugin("tool", "onesig_v2_5_3_D20250710")
+
+        # Mimic the runtime bootstrap that records the credentials/enabled
+        # block keyed on the plugin's storage_key.
+        storage_key = "onesig_api_v2_5_3_D20250710"
+        ConfigWriter.set_api_service(storage_key, {"enabled": True})
+        assert ConfigWriter.get_api_service_raw(storage_key) is not None
+
+        await uninstall_plugin("tool", "onesig_v2_5_3_D20250710")
+
+        assert ConfigWriter.get_api_service_raw(storage_key) is None, (
+            "uninstall_plugin should remove the orphaned api_services entry "
+            "so the api-services UI doesn't show a phantom service"
+        )
+
+    async def test_uninstall_keeps_api_service_when_other_install_still_declares_it(
+        self, isolated_hub,
+    ):
+        """If two installed plugin dirs declare the same storage_key,
+        uninstalling one of them must NOT drop the shared
+        ``api_services`` entry — the surviving plugin still depends on it.
+        """
+        from flocks.config.config_writer import ConfigWriter
+
+        _write_bundled_tool(
+            isolated_hub["bundled"],
+            plugin_id="onesig_a",
+            service_id="onesig_shared",
+            version="2.5.3",
+        )
+        _write_bundled_tool(
+            isolated_hub["bundled"],
+            plugin_id="onesig_b",
+            service_id="onesig_shared",
+            version="2.5.3",
+        )
+        await install_plugin("tool", "onesig_a")
+        await install_plugin("tool", "onesig_b")
+
+        storage_key = "onesig_shared_v2_5_3"
+        ConfigWriter.set_api_service(storage_key, {"enabled": True})
+
+        await uninstall_plugin("tool", "onesig_a")
+
+        assert ConfigWriter.get_api_service_raw(storage_key) is not None, (
+            "shared api_services entry must survive when another installed "
+            "plugin still declares the same storage_key"
+        )
 
     async def test_two_versions_install_side_by_side(self, isolated_hub):
         """Different ``service_id`` + same conceptual product can coexist.
@@ -341,6 +429,119 @@ class TestBundledInstallFlow:
         descriptors = {d.storage_key for d in discover_api_service_descriptors(refresh=True)}
         assert "onesig_v2_5_3_D20250710_api_v2_5_3_D20250710" in descriptors
         assert "onesig_api_v2_5_3_D20260321" in descriptors
+
+
+# ---------------------------------------------------------------------------
+# Cascade: delete_api_service → uninstall backing plugin
+# ---------------------------------------------------------------------------
+
+class TestDeleteApiServiceCascade:
+    """Covers ``delete_api_service`` + ``_find_user_installed_tool_plugin_for``.
+
+    The helper function is the contract: given a storage_key, it must
+    return the user-installed plugin id (when one backs it) or ``None``
+    otherwise. End-to-end cascade behaviour is exercised by calling
+    the route function directly so we don't depend on a live server.
+    """
+
+    async def test_finds_user_installed_plugin_by_storage_key(self, isolated_hub):
+        from flocks.server.routes.provider import _find_user_installed_tool_plugin_for
+
+        _write_bundled_tool(
+            isolated_hub["bundled"],
+            plugin_id="onesig_v2_5_3_D20250710",
+            service_id="onesig_api",
+            version="2.5.3 D20250710",
+        )
+        await install_plugin("tool", "onesig_v2_5_3_D20250710")
+
+        plugin_id = _find_user_installed_tool_plugin_for("onesig_api_v2_5_3_D20250710")
+        assert plugin_id == "onesig_v2_5_3_D20250710"
+
+    async def test_returns_none_when_storage_key_unknown(self, isolated_hub):
+        from flocks.server.routes.provider import _find_user_installed_tool_plugin_for
+        assert _find_user_installed_tool_plugin_for("nonexistent_v9_9_9") is None
+
+    async def test_returns_none_for_project_level_plugin(self, isolated_hub, monkeypatch):
+        """Project-level plugins (under ``<cwd>/.flocks/plugins/``) are
+        NOT considered "user-installed" — we don't want a delete from
+        the api-services UI to wipe a project-tracked plugin.
+        """
+        from flocks.server.routes.provider import _find_user_installed_tool_plugin_for
+
+        project_plugin_dir = (
+            isolated_hub["project"] / ".flocks" / "plugins" / "tools" / "api" / "project_tool"
+        )
+        project_plugin_dir.mkdir(parents=True)
+        (project_plugin_dir / "_provider.yaml").write_text(
+            "name: project_tool\nservice_id: project_api\nversion: '1.0.0'\n",
+            encoding="utf-8",
+        )
+
+        from flocks.config import api_versioning as versioning
+        versioning._reset_descriptor_cache()
+
+        assert _find_user_installed_tool_plugin_for("project_api_v1_0_0") is None
+
+    async def test_install_refreshes_descriptor_cache(self, isolated_hub):
+        """``install_plugin`` must drop ``discover_api_service_descriptors``'
+        process-level cache.
+
+        Otherwise the api-services UI's ``_load_provider_yaml_metadata``
+        — which reads via the *cached* descriptor list — keeps returning
+        ``None`` for the freshly installed plugin until the next process
+        restart, leaving its ``version`` / ``name`` blank in the
+        ``GET /api/provider/api-services`` response.
+        """
+        from flocks.config import api_versioning as versioning
+
+        _write_bundled_tool(
+            isolated_hub["bundled"],
+            plugin_id="onesig_v2_5_3_D20250710",
+            service_id="onesig_api",
+            version="2.5.3 D20250710",
+        )
+
+        # Prime the cache with the *empty* set (no plugins installed yet).
+        assert versioning.discover_api_service_descriptors() == []
+
+        await install_plugin("tool", "onesig_v2_5_3_D20250710")
+
+        # Without an explicit refresh inside install_plugin, this would
+        # still return the empty list from the prior cache hit.
+        descriptors = versioning.discover_api_service_descriptors()
+        keys = {d.storage_key for d in descriptors}
+        assert "onesig_api_v2_5_3_D20250710" in keys
+
+    async def test_delete_api_service_cascades_to_uninstall(self, isolated_hub):
+        """End-to-end: deleting the api-service entry should also
+        uninstall the backing user-installed plugin so the FlocksHub
+        catalog no longer reports it as ``installed``.
+        """
+        from flocks.config.config_writer import ConfigWriter
+        from flocks.server.routes.provider import delete_api_service
+
+        _write_bundled_tool(
+            isolated_hub["bundled"],
+            plugin_id="onesig_v2_5_3_D20250710",
+            service_id="onesig_api",
+            version="2.5.3 D20250710",
+        )
+        record = await install_plugin("tool", "onesig_v2_5_3_D20250710")
+        install_path = Path(record.installPath)
+        storage_key = "onesig_api_v2_5_3_D20250710"
+        ConfigWriter.set_api_service(storage_key, {"enabled": True})
+
+        result = await delete_api_service(storage_key)
+        assert result == {"success": True}
+
+        # Plugin gone from disk + records, api-services entry gone too.
+        assert not install_path.exists()
+        assert ConfigWriter.get_api_service_raw(storage_key) is None
+
+        # Catalog reverts the entry to ``available``.
+        entries = catalog.list_catalog(plugin_type="tool", state=["available"])
+        assert any(e.id == "onesig_v2_5_3_D20250710" for e in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +588,111 @@ class TestPackageValidationSkipNames:
         (package / "evil").symlink_to(outside)
         with pytest.raises(ValueError, match="escapes"):
             validate_package(package, self._manifest())
+
+
+# ---------------------------------------------------------------------------
+# API-service summary name disambiguation
+# ---------------------------------------------------------------------------
+
+class TestDisambiguateSummaryNames:
+    """Multi-version siblings need clear labels in the api-services UI.
+
+    The plugin author's ``_provider.yaml`` ``name`` field is what the
+    Tools page renders. When two installs of the same product live
+    side-by-side under different versions, the user has to be able to
+    tell rows apart — otherwise they cannot map a row back to which
+    FlocksHub install backs it.
+    """
+
+    def _summary(
+        self,
+        *,
+        id: str,
+        name: str,
+        version: str | None,
+        tool_count: int = 0,
+    ):
+        from flocks.server.routes.provider import APIServiceSummary
+        return APIServiceSummary(
+            id=id,
+            name=name,
+            version=version,
+            enabled=True,
+            status="unknown",
+            tool_count=tool_count,
+        )
+
+    def test_same_name_siblings_get_version_suffix(self):
+        from flocks.server.routes.provider import _disambiguate_summary_names
+
+        items = [
+            self._summary(id="onesig_api_v2_5_3_D20260321", name="onesig", version="2.5.3 D20260321"),
+            self._summary(id="onesig_api_v2_5_3_D20250710", name="onesig", version="2.5.3 D20250710"),
+        ]
+        _disambiguate_summary_names(items)
+
+        assert {i.name for i in items} == {
+            "onesig (v2.5.3 D20260321)",
+            "onesig (v2.5.3 D20250710)",
+        }
+
+    def test_same_service_id_family_gets_suffix_even_with_distinct_names(self):
+        """Different ``name``s but same ``service_id`` (just versioned
+        storage_keys) → user sees consistent ``(v…)`` suffixing on every
+        sibling so the family is visually grouped.
+        """
+        from flocks.server.routes.provider import _disambiguate_summary_names
+
+        items = [
+            self._summary(id="onesig_api_v2_5_3_D20260321", name="onesig", version="2.5.3 D20260321"),
+            # Same family root (``onesig_api``), different name spelling.
+            self._summary(id="onesig_api_v3_0_0", name="onesig-next", version="3.0.0"),
+        ]
+        _disambiguate_summary_names(items)
+
+        # Both rows now carry the version suffix.
+        assert items[0].name == "onesig (v2.5.3 D20260321)"
+        assert items[1].name == "onesig-next (v3.0.0)"
+
+    def test_single_version_entry_keeps_short_name(self):
+        from flocks.server.routes.provider import _disambiguate_summary_names
+
+        items = [self._summary(id="solo_api_v1_0_0", name="solo", version="1.0.0")]
+        _disambiguate_summary_names(items)
+        assert items[0].name == "solo"
+
+    def test_name_already_contains_version_is_not_decorated(self):
+        """When the plugin author has already baked the version into
+        ``name`` (e.g. ``onesig_v2_5_3_D20250710``), don't pile on a
+        ``(v2.5.3 D20250710)`` suffix and produce noise.
+        """
+        from flocks.server.routes.provider import _disambiguate_summary_names
+
+        items = [
+            self._summary(
+                id="onesig_v2_5_3_D20250710_api_v2_5_3_D20250710",
+                name="onesig_v2_5_3_D20250710",
+                version="2.5.3 D20250710",
+            ),
+            self._summary(
+                id="onesig_api_v2_5_3_D20260321",
+                name="onesig",
+                version="2.5.3 D20260321",
+            ),
+        ]
+        _disambiguate_summary_names(items)
+        # First name already embeds the version → unchanged.
+        assert items[0].name == "onesig_v2_5_3_D20250710"
+        # Second is a one-of-its-family entry with a unique name → also unchanged.
+        assert items[1].name == "onesig"
+
+    def test_unversioned_entry_is_left_alone(self):
+        from flocks.server.routes.provider import _disambiguate_summary_names
+
+        items = [
+            self._summary(id="legacy_api", name="legacy", version=None),
+            self._summary(id="other_api_v1_0_0", name="other", version="1.0.0"),
+        ]
+        _disambiguate_summary_names(items)
+        assert items[0].name == "legacy"
+        assert items[1].name == "other"
