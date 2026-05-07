@@ -143,6 +143,38 @@ class TestDiscovery:
         refreshed = discover_api_service_descriptors(refresh=True)
         assert {d.storage_key for d in refreshed} == {"qingteng", "tdp_api_v3_3_10"}
 
+    def test_multiple_versions_of_same_service_id_coexist(self, api_root):
+        """Two plugin dirs with the same ``service_id`` but distinct
+        ``version`` values must each emit their own descriptor.
+
+        Regression test for the bug where flockshub couldn't tell
+        ``onesig_v2_5_3_D20250710`` apart from
+        ``onesig_v2_5_3_D20260321`` and only loaded the newer one.
+        Discovery is keyed on ``storage_key`` (= ``service_id`` + version
+        suffix), so as long as the version differs both versions survive
+        the ``setdefault`` in ``discover_api_service_descriptors``.
+        """
+        _write_provider_yaml(
+            api_root / "onesig_v2_5_3_D20250710",
+            service_id="onesig_api",
+            version="2.5.3 D20250710",
+        )
+        _write_provider_yaml(
+            api_root / "onesig_v2_5_3_D20260321",
+            service_id="onesig_api",
+            version="2.5.3 D20260321",
+        )
+
+        descriptors = discover_api_service_descriptors(refresh=True)
+        by_key = {d.storage_key: d for d in descriptors}
+
+        assert "onesig_api_v2_5_3_D20250710" in by_key
+        assert "onesig_api_v2_5_3_D20260321" in by_key
+        assert by_key["onesig_api_v2_5_3_D20250710"].service_id == "onesig_api"
+        assert by_key["onesig_api_v2_5_3_D20260321"].service_id == "onesig_api"
+        assert by_key["onesig_api_v2_5_3_D20250710"].version == "2.5.3 D20250710"
+        assert by_key["onesig_api_v2_5_3_D20260321"].version == "2.5.3 D20260321"
+
 
 # ---------------------------------------------------------------------------
 # legacy_service_id_for / shadowed_legacy_ids
