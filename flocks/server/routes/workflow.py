@@ -1026,21 +1026,59 @@ async def workflow_center_stop(workflow_id: str):
 
 @router.post("/workflow-center/{workflow_id}/invoke")
 async def workflow_center_invoke(workflow_id: str, req: WorkflowCenterInvokeRequest):
-    """Proxy invoke request to active published workflow service."""
+    """Proxy invoke request to active published workflow service.
+
+    Also records execution stats (callCount / successCount / errorCount) so
+    that the UI invocation counter is updated for every published-service call,
+    not just agent-driven /run calls.
+    """
+    started = time.time()
+    exec_data = await create_execution_record(
+        workflow_id,
+        input_params=req.inputs or {},
+    )
+    exec_id = str(exec_data["id"])
     try:
-        return await invoke_published_workflow(
+        result = await invoke_published_workflow(
             workflow_id,
             inputs=req.inputs,
             timeout_s=req.timeout_s,
             request_id=req.request_id,
         )
-    except WorkflowNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except WorkflowNotPublishedError as e:
+        duration = time.time() - started
+        raw_status = result.get("status", "SUCCEEDED") if isinstance(result, dict) else "SUCCEEDED"
+        status_value = _normalize_execution_status(raw_status)
+        success = status_value == "success"
+        await _update_workflow_stats(workflow_id, success, duration)
+        exec_data.update({
+            "outputResults": result.get("outputs", {}) if isinstance(result, dict) else {},
+            "status": status_value,
+            "finishedAt": int(time.time() * 1000),
+            "duration": duration,
+            "currentPhase": status_value,
+        })
+        await _record_execution_result(workflow_id, exec_id, exec_data)
+        return result
+    except (WorkflowNotFoundError, WorkflowNotPublishedError) as e:
+        duration = time.time() - started
+        await _update_workflow_stats(workflow_id, False, duration)
+        exec_data.update({"status": "error", "finishedAt": int(time.time() * 1000),
+                          "duration": duration, "errorMessage": str(e)})
+        await _record_execution_result(workflow_id, exec_id, exec_data)
         raise HTTPException(status_code=404, detail=str(e))
     except WorkflowCenterError as e:
+        duration = time.time() - started
+        await _update_workflow_stats(workflow_id, False, duration)
+        exec_data.update({"status": "error", "finishedAt": int(time.time() * 1000),
+                          "duration": duration, "errorMessage": str(e)})
+        await _record_execution_result(workflow_id, exec_id, exec_data)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        duration = time.time() - started
+        await _update_workflow_stats(workflow_id, False, duration)
+        exec_data.update({"status": "error", "finishedAt": int(time.time() * 1000),
+                          "duration": duration, "errorMessage": str(e)})
+        await _record_execution_result(workflow_id, exec_id, exec_data)
         log.error("workflow.center.invoke.error", {"workflow_id": workflow_id, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to invoke workflow service: {str(e)}")
 
