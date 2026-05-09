@@ -231,7 +231,7 @@ async def lifespan(app: FastAPI):
 
     # Start syslog listeners for workflows with syslog enabled
     try:
-        from flocks.syslog.manager import default_manager as default_syslog_manager
+        from flocks.ingest.syslog.manager import default_manager as default_syslog_manager
 
         await default_syslog_manager.start_all()
         log.info("syslog.manager.started")
@@ -285,7 +285,7 @@ async def lifespan(app: FastAPI):
 
     # Stop syslog listeners
     try:
-        from flocks.syslog.manager import default_manager as default_syslog_manager
+        from flocks.ingest.syslog.manager import default_manager as default_syslog_manager
 
         await default_syslog_manager.stop_all()
         log.info("syslog.manager.stopped")

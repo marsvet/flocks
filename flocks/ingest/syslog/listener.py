@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Awaitable, Callable, Union
 
-from flocks.syslog.parser import parse_syslog
+from flocks.ingest.syslog.parser import parse_syslog
 
 OnSyslogMessage = Callable[[dict], Union[None, Awaitable[None]]]
 

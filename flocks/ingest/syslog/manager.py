@@ -10,8 +10,8 @@ from flocks.utils.log import Log
 from flocks.workflow.fs_store import read_workflow_from_fs
 from flocks.workflow.runner import run_workflow
 
-from flocks.syslog.constants import WORKFLOW_SYSLOG_CONFIG_PREFIX
-from flocks.syslog.listener import run_tcp_syslog_server, run_udp_syslog_server
+from flocks.ingest.syslog.constants import WORKFLOW_SYSLOG_CONFIG_PREFIX
+from flocks.ingest.syslog.listener import run_tcp_syslog_server, run_udp_syslog_server
 
 log = Log.create(service="syslog.manager")
 

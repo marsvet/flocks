@@ -44,7 +44,7 @@ from flocks.workflow.fs_store import (
     read_workflow_from_fs as shared_read_workflow_from_fs,
     workflow_scan_dirs as _all_scan_dirs,
 )
-from flocks.syslog.constants import WORKFLOW_SYSLOG_CONFIG_PREFIX
+from flocks.ingest.syslog.constants import WORKFLOW_SYSLOG_CONFIG_PREFIX
 from flocks.workflow.execution_store import (
     create_execution_record,
     normalize_execution_status as _normalize_execution_status,
@@ -817,7 +817,7 @@ async def delete_workflow(workflow_id: str):
             pass
 
         try:
-            from flocks.syslog.manager import default_manager as _syslog_default_manager
+            from flocks.ingest.syslog.manager import default_manager as _syslog_default_manager
 
             await _syslog_default_manager.stop_workflow(workflow_id)
         except Exception:
@@ -1610,7 +1610,7 @@ async def save_syslog_config(workflow_id: str, req: SyslogConfigRequest):
         }
         await Storage.write(_syslog_config_key(workflow_id), config)
 
-        from flocks.syslog.manager import default_manager as _syslog_default_manager
+        from flocks.ingest.syslog.manager import default_manager as _syslog_default_manager
 
         await _syslog_default_manager.restart_workflow(workflow_id)
         return {"ok": True}
