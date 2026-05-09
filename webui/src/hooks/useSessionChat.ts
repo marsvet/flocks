@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import client from '@/api/client';
+import { buildPromptParts, type ImagePartData } from '@/utils/imageUpload';
 
 export interface UseSessionChatOptions {
   title: string;
@@ -93,10 +94,14 @@ export function useSessionChat({
   }, []);
 
   const createAndSend = useCallback(
-    async (text: string, agent?: string): Promise<string> => {
+    async (
+      text: string,
+      imageParts?: ImagePartData[],
+      agent?: string,
+    ): Promise<string> => {
       const sid = await create();
       const payload: Record<string, unknown> = {
-        parts: [{ type: 'text', text }],
+        parts: buildPromptParts(text, imageParts),
       };
       if (agent) payload.agent = agent;
       client.post(`/api/session/${sid}/prompt_async`, payload).catch(() => {});

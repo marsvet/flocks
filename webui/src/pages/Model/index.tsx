@@ -16,6 +16,7 @@ import { useToast } from '@/components/common/Toast';
 import EntitySheet from '@/components/common/EntitySheet';
 import { useProviders, type EnrichedProvider } from '@/hooks/useProviders';
 import { useSSE } from '@/hooks/useSSE';
+import { MODEL_CHANGED_EVENT } from '@/hooks/useDefaultModelVision';
 import {
   providerAPI, modelV2API, usageAPI,
   customAPI, modelSettingsAPI, catalogAPI, defaultModelAPI,
@@ -2864,6 +2865,13 @@ function SetDefaultModelDialog({
       await defaultModelAPI.set('llm', providerId, modelId);
       toast.success(t('dashboard.defaultModelUpdated'));
       onSaved({ provider_id: providerId, model_id: modelId });
+      // Tell every chat composer (Session, Agent / Workflow / Skill creators,
+      // EntitySheet, ChatDialog, …) to re-resolve the default model's vision
+      // capability so the "model does not support images" hint reflects the
+      // new selection without a page reload.
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent(MODEL_CHANGED_EVENT));
+      }
     } catch {
       toast.error(t('operationFailed'));
     } finally {
