@@ -42,11 +42,14 @@ async function resolveVisionSupport(): Promise<VisionState> {
     if (!provider_id || !model_id) return null;
     const defResp = await modelV2API.getDefinition(provider_id, model_id);
     const def: any = defResp.data;
-    // Predefined (catalog/SDK) models have vision handled at the provider
-    // level.  We intentionally treat them as non-vision here so that only
-    // user-added (fetch_from === 'customizable') models that have explicitly
-    // enabled vision trigger the multimodal upload flow.
-    if (!def || def.fetch_from !== 'customizable') return null;
+    if (!def) return null;
+    // Predefined (catalog/SDK) models have their vision capability sourced
+    // from the provider definition and are deliberately reported as
+    // non-vision here. The product decision is that multimodal uploads are
+    // only unlocked for user-added models the user has explicitly opted
+    // into. Returning ``false`` (instead of ``null``) makes the chat UI
+    // surface the "model does not support images" hint and block uploads.
+    if (def.fetch_from !== 'customizable') return false;
     const caps = def.capabilities;
     if (!caps) return null;
     if (

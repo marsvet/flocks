@@ -50,12 +50,14 @@ describe('useDefaultModelVision', () => {
     await waitFor(() => expect(result.current).toBe(false));
   });
 
-  it('returns null for a predefined (built-in) model even when it declares vision support', async () => {
+  it('returns false for a predefined (built-in) model even when it declares vision support', async () => {
+    // Predefined models are treated as non-vision regardless of capability
+    // flags so the UI shows the "not supported" hint and blocks uploads.
     mockResolved.mockResolvedValue(makeResolvedResp());
     mockDefinition.mockResolvedValue(makeDefResp({ supports_vision: true }, 'predefined'));
 
     const { result } = renderHook(() => useDefaultModelVision());
-    await waitFor(() => expect(result.current).toBeNull());
+    await waitFor(() => expect(result.current).toBe(false));
   });
 
   it('returns null when capabilities are absent', async () => {
