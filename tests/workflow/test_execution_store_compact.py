@@ -223,3 +223,45 @@ def test_default_compact_size_threshold_is_reasonable() -> None:
     # (a few dozen items at most) intact, but low enough that megabyte-
     # scale payloads get compacted on every triggered execution.
     assert 1 <= DEFAULT_COMPACT_SIZE_THRESHOLD <= 1_000
+
+
+# ── create_execution_record compacts inputParams ─────────────────────────────
+
+
+def test_compact_outputs_covers_input_params_batch_key() -> None:
+    """HTTP /run batch calls may pass a large ``alerts`` list as inputParams.
+    ``compact_outputs_for_storage`` must compact it when the key is in
+    ``DEFAULT_LARGE_LIST_KEYS`` – this is what ``create_execution_record``
+    now does before writing to SQLite.
+    """
+    batch_inputs = {
+        "alerts": _make_alerts(5_000),
+        "filter_enabled": True,
+        "threshold": 0.7,
+    }
+
+    compacted = compact_outputs_for_storage(batch_inputs)
+
+    assert "_alerts_count" not in compacted, (
+        "'alerts' is not in DEFAULT_LARGE_LIST_KEYS so it should pass through unchanged"
+    )
+    # Scalar fields must survive unchanged.
+    assert compacted["filter_enabled"] is True
+    assert compacted["threshold"] == 0.7
+
+
+def test_compact_outputs_covers_raw_alerts_in_input_params() -> None:
+    """When inputParams contains ``raw_alerts`` (a key that IS in
+    DEFAULT_LARGE_LIST_KEYS), it must be compacted.
+    """
+    batch_inputs = {
+        "raw_alerts": _make_alerts(5_000),
+        "source_log_type": "tdp",
+    }
+
+    compacted = compact_outputs_for_storage(batch_inputs)
+
+    assert "_raw_alerts_count" in compacted
+    assert compacted["_raw_alerts_count"] == 5_000
+    assert "raw_alerts" not in compacted
+    assert compacted["source_log_type"] == "tdp"
