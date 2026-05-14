@@ -235,10 +235,17 @@ async def create_execution_record(
     input_params: Optional[Dict[str, Any]] = None,
     exec_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create and persist a running workflow execution record."""
+    """Create and persist a running workflow execution record.
+
+    *input_params* is compacted with the same policy as outputResults so that
+    batch HTTP calls passing large alert lists (e.g. ``{"alerts": [...10k...]}``
+    ) don't bloat the SQLite row with data that is already persisted to disk by
+    the workflow itself.
+    """
+    compacted_params = compact_outputs_for_storage(input_params or {})
     exec_data = build_initial_execution_record(
         workflow_id,
-        input_params=input_params,
+        input_params=compacted_params,
         exec_id=exec_id,
     )
     await Storage.write(workflow_execution_key(exec_data["id"]), exec_data)
