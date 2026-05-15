@@ -182,16 +182,6 @@ export default function SessionPage() {
     }
   }, [creating, addSession, toast, t]);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.altKey && e.key === 'n') {
-        e.preventDefault();
-        void handleCreateSession();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleCreateSession]);
 
   const handleCreateAndSend = useCallback(async (
     text: string,
@@ -411,9 +401,6 @@ export default function SessionPage() {
                 {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
                 <span>{t('newSession')}</span>
               </div>
-              <kbd className="text-xs text-gray-500 bg-gray-800 border border-gray-700 px-1.5 py-0.5 rounded font-mono leading-none">
-                Alt+N
-              </kbd>
             </button>
             <div className="relative">
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400 pointer-events-none" />
