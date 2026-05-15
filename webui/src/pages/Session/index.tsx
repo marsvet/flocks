@@ -62,6 +62,24 @@ export default function SessionPage() {
     [sessions, selectedSessionId],
   );
 
+  // 今天/昨天不限制；本周/上周/更早默认只显示 5 条
+  const GROUP_DEFAULT_LIMIT: Record<string, number> = {
+    today: Infinity,
+    yesterday: Infinity,
+    thisWeek: 5,
+    lastWeek: 5,
+    earlier: 5,
+  };
+
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const toggleGroupExpand = useCallback((key: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  }, []);
+
   const groupedSessions = useMemo(() => {
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
@@ -426,12 +444,21 @@ export default function SessionPage() {
               <p className="text-sm">{t('noResults', 'No conversations found')}</p>
             </div>
           ) : (
-            groupedSessions.map(({ key, labelKey, items }) => (
+            groupedSessions.map(({ key, labelKey, items }) => {
+              const isSearching = searchQuery.trim().length > 0;
+              const limit = isSearching ? Infinity : (GROUP_DEFAULT_LIMIT[key] ?? 5);
+              const isExpanded = expandedGroups.has(key);
+              const visibleItems = (isSearching || isExpanded || items.length <= limit)
+                ? items
+                : items.slice(0, limit);
+              const hiddenCount = items.length - visibleItems.length;
+
+              return (
               <div key={key}>
                 <div className="px-4 pt-4 pb-1 text-xs font-semibold text-gray-400 uppercase tracking-wide select-none">
                   {t(labelKey, labelKey)}
                 </div>
-                {items.map((session) => (
+                {visibleItems.map((session) => (
                   <div
                     key={session.id}
                     onClick={() => selectMode ? handleToggleCheck(session.id) : setSelectedSessionId(session.id)}
@@ -541,8 +568,28 @@ export default function SessionPage() {
                     )}
                   </div>
                 ))}
+                {/* 展开/收起按钮 */}
+                {!isSearching && hiddenCount > 0 && (
+                  <button
+                    onClick={() => toggleGroupExpand(key)}
+                    className="mx-4 mb-1 flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 transition-colors py-1"
+                  >
+                    <ChevronDown className="w-3 h-3" />
+                    <span>{t('showMore', { count: hiddenCount })}</span>
+                  </button>
+                )}
+                {!isSearching && isExpanded && items.length > (GROUP_DEFAULT_LIMIT[key] ?? 5) && (
+                  <button
+                    onClick={() => toggleGroupExpand(key)}
+                    className="mx-4 mb-1 flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 transition-colors py-1"
+                  >
+                    <ChevronDown className="w-3 h-3 rotate-180" />
+                    <span>{t('showLess', 'Show less')}</span>
+                  </button>
+                )}
               </div>
-            ))
+              );
+            })
           )}
         </div>
 

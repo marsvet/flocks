@@ -116,5 +116,7 @@
   "groupLastWeek": "上周",
   "groupEarlier": "更早",
   "filterConversations": "搜索会话...",
-  "noResults": "没有匹配的会话"
+  "noResults": "没有匹配的会话",
+  "showMore": "显示更多 {{count}} 条",
+  "showLess": "收起"
 }

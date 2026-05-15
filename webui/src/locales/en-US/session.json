@@ -116,5 +116,7 @@
   "groupLastWeek": "Last Week",
   "groupEarlier": "Earlier",
   "filterConversations": "Filter conversations...",
-  "noResults": "No conversations found"
+  "noResults": "No conversations found",
+  "showMore": "Show {{count}} more",
+  "showLess": "Show less"
 }
