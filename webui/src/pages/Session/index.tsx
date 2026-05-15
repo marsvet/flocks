@@ -572,23 +572,23 @@ export default function SessionPage() {
         {sessions.length > 0 && (
           <div className="border-t border-gray-100 px-3 py-2 flex-shrink-0">
             {selectMode ? (
-              <div className="flex items-stretch gap-1.5">
+              <div className="grid grid-cols-3 gap-1.5">
                 <button
                   onClick={handleExitSelectMode}
-                  className="flex items-center justify-center px-2.5 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg transition-colors whitespace-nowrap"
+                  className="flex items-center justify-center py-2 text-sm text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
                 >
                   {t('cancelSelect')}
                 </button>
                 <button
                   onClick={handleSelectAll}
-                  className="flex flex-1 items-center justify-center px-2 py-2 text-sm text-blue-600 hover:bg-blue-50 rounded-lg transition-colors text-center"
+                  className="flex items-center justify-center py-2 text-sm text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors"
                 >
                   {checkedIds.size === sessions.length && sessions.length > 0 ? t('deselectAll') : t('selectAll')}
                 </button>
                 <button
                   onClick={handleBatchDelete}
                   disabled={checkedIds.size === 0 || batchDeleting}
-                  className="flex items-center justify-center px-2.5 py-2 text-red-500 hover:bg-red-50 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  className="flex items-center justify-center py-2 text-sm text-red-600 bg-red-50 hover:bg-red-100 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   title={t('deleteSelected', { count: checkedIds.size })}
                 >
                   {batchDeleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
