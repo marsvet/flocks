@@ -19,6 +19,7 @@ import client from '@/api/client';
 import { useDefaultModelVision } from '@/hooks/useDefaultModelVision';
 import { buildPromptParts, type ImagePartData } from '@/utils/imageUpload';
 import { getAgentDisplayDescription } from '@/utils/agentDisplay';
+import { formatSessionDate } from '@/utils/time';
 
 function sanitizeSessionExportName(value: string) {
   const trimmed = value.trim();
@@ -447,14 +448,15 @@ export default function SessionPage() {
                   <div
                     key={session.id}
                     onClick={() => selectMode ? handleToggleCheck(session.id) : setSelectedSessionId(session.id)}
-                    className={`group relative mx-2 px-2 py-2 rounded-lg cursor-pointer transition-colors ${
+                    className={`group relative mx-2 mb-1 px-3 py-2.5 rounded-xl border cursor-pointer transition-all duration-150 ${
                       !selectMode && selectedSessionId === session.id
-                        ? 'bg-gray-100'
+                        ? 'bg-gray-100 border-gray-300 shadow-sm'
                         : selectMode && checkedIds.has(session.id)
-                        ? 'bg-blue-50'
-                        : 'hover:bg-gray-100'
+                        ? 'bg-blue-50 border-blue-200'
+                        : 'border-gray-100 hover:border-gray-200 hover:bg-gray-50 hover:shadow-sm'
                     }`}
                   >
+                    {/* Title row */}
                     <div className="flex items-center gap-1.5 min-w-0 pr-7">
                       {selectMode && (
                         <input
@@ -493,13 +495,19 @@ export default function SessionPage() {
                           data-session-rename-input
                         />
                       ) : (
-                        <span className="truncate text-sm text-gray-800">{session.title}</span>
+                        <span className="truncate text-sm font-medium text-gray-800">{session.title}</span>
                       )}
                     </div>
+                    {/* Timestamp row */}
+                    {session.time?.updated && renamingSessionId !== session.id && (
+                      <p className="mt-1 text-xs text-gray-400 truncate pl-0.5">
+                        {formatSessionDate(session.time.updated)}
+                      </p>
+                    )}
 
                     {/* Three-dot menu */}
                     {!selectMode && (
-                      <div className="absolute right-1.5 top-1/2 -translate-y-1/2" data-session-actions>
+                      <div className="absolute right-1.5 top-2" data-session-actions>
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
