@@ -553,20 +553,20 @@ export default function SessionPage() {
 
         {/* Bottom：批量操作栏 / 批量选择入口 */}
         {sessions.length > 0 && (
-          <div className="border-t border-gray-100 px-3 py-2 flex-shrink-0">
+          <div className="border-t border-gray-100 px-3 pt-3 pb-4 flex-shrink-0">
             {selectMode ? (
               <div className="grid grid-cols-3 gap-1.5">
-                <button
-                  onClick={handleExitSelectMode}
-                  className="flex items-center justify-center py-2 text-sm text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
-                >
-                  {t('cancelSelect')}
-                </button>
                 <button
                   onClick={handleSelectAll}
                   className="flex items-center justify-center py-2 text-sm text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-lg transition-colors"
                 >
                   {checkedIds.size === sessions.length && sessions.length > 0 ? t('deselectAll') : t('selectAll')}
+                </button>
+                <button
+                  onClick={handleExitSelectMode}
+                  className="flex items-center justify-center py-2 text-sm text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+                >
+                  {t('cancelSelect')}
                 </button>
                 <button
                   onClick={handleBatchDelete}
