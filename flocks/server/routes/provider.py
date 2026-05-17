@@ -882,6 +882,7 @@ class APIServiceSummary(BaseModel):
     description_cn: Optional[str] = None
     builtin: bool = False
     verify_ssl: bool = False
+    integration_type: Optional[str] = None  # e.g. "device" for security device APIs
 
 
 class APIServiceUpdateRequest(BaseModel):
@@ -1291,6 +1292,7 @@ def _build_api_service_summary(
         description_cn=meta.get("description_cn"),
         builtin=_is_api_service_builtin(provider_id, matched_tools),
         verify_ssl=verify_ssl,
+        integration_type=meta.get("integration_type"),
     )
 
 
@@ -1669,6 +1671,7 @@ def _load_provider_yaml_metadata(provider_id: str) -> Optional[Dict[str, Any]]:
             "credential_fields": prov.get("credential_fields"),
             "defaults": prov.get("defaults", {}),
             "apis": tool_apis or None,
+            "integration_type": prov.get("integration_type"),
         }
     except Exception as e:
         log.debug("provider.yaml_metadata.load_failed", {"provider_id": provider_id, "error": str(e)})

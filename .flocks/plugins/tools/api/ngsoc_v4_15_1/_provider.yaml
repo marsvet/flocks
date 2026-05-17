@@ -1,6 +1,7 @@
 name: ngsoc
 service_id: ngsoc_api
 version: "4.15.1"
+integration_type: device
 description: >
   Qi-Anxin NGSOC (NGSOC-BD / NGSOC-LV) Web API service. Authentication is
   token-based: every request carries the static ``NGSOC-Access-Token`` HTTP

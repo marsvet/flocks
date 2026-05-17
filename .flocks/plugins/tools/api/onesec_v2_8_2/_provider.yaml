@@ -1,6 +1,7 @@
 name: onesec
 service_id: onesec_api
 version: "2.8.2"
+integration_type: device
 description: >
   OneSEC endpoint security platform API service. Configure API Key, Secret,
   and optional Base URL separately in the credentials form. Base URL defaults

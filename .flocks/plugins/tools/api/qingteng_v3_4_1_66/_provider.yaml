@@ -1,6 +1,7 @@
 name: qingteng
 service_id: qingteng
 version: "3.4.1.66"
+integration_type: device
 description: QingTeng cloud security platform - host security, vulnerability detection, and intrusion monitoring.
 description_cn: 青藤云安全平台 - 主机安全、漏洞检测、入侵检测
 auth:

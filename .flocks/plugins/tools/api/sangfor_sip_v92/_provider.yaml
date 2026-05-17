@@ -1,6 +1,7 @@
 name: sangfor_sip
 service_id: sangfor_sip
 version: "9.2"
+integration_type: device
 description: >
   Sangfor SIP (Security Intelligence Platform) third-party data pull API
   (v9.2 / "92 version" spec). Supports pulling asset, security event, risk,

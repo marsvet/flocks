@@ -1,6 +1,7 @@
 name: sangfor_af
 service_id: sangfor_af
 version: "8.0.106"
+integration_type: device
 description: >
   Sangfor AF (Application Firewall) v8.0.106 REST API service (latest).
   Includes all features from v8.0.85 plus extended session management

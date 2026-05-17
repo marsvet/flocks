@@ -224,6 +224,8 @@ export interface APIServiceSummary {
   description_cn?: string;
   builtin?: boolean;
   verify_ssl: boolean;
+  /** "device" for security device APIs (set via integration_type in _provider.yaml) */
+  integration_type?: string;
 }
 
 export interface APIServiceCredentialField {

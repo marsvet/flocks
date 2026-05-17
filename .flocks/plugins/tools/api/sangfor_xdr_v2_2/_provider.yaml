@@ -1,6 +1,7 @@
 name: sangfor_xdr
 service_id: sangfor_xdr
 version: "2.2"
+integration_type: device
 description: >
   Sangfor XDR (Extended Detection and Response) Open API.
   Provides unified security operations including alert/incident management,

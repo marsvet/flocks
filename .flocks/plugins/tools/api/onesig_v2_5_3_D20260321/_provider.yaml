@@ -1,6 +1,7 @@
 name: onesig
 service_id: onesig_api
 version: "2.5.3 D20260321"
+integration_type: device
 description: >
   OneSIG (Secure Internet Gateway) Web API service. Authentication uses cookie
   session: the handler logs in with username + RSA-OAEP encrypted password and
