@@ -1,13 +1,16 @@
 """Synchronise LLM tool visibility with device enabled/disabled state.
 
-Rule:
-  ≥1 enabled device instance for service_id  →  api_services[storage_key].enabled = True
-  0  enabled device instances                 →  api_services[storage_key].enabled = False
+Rule (per storage_key):
+  ≥1 enabled device instance sharing a storage_key  →  api_services[storage_key].enabled = True
+  0  enabled device instances for a storage_key      →  api_services[storage_key].enabled = False
 
-After writing ``flocks.json``, triggers ``ToolRegistry._sync_api_service_states()``
-so the change is visible to the LLM immediately, without a server restart.
+Using per-storage-key logic means two instances of the same product type
+(different storage_keys) are enabled/disabled independently.
 """
 from __future__ import annotations
+
+from collections import defaultdict
+from typing import Dict
 
 from flocks.storage.storage import Storage
 from flocks.utils.log import Log
@@ -16,27 +19,30 @@ log = Log.create(service="tool.device.sync")
 
 
 async def sync_service_tool_state(service_id: str) -> None:
-    """Sync tool visibility for every storage_key that belongs to *service_id*."""
+    """Sync tool visibility for every storage_key that belongs to *service_id*.
+
+    For each distinct storage_key under the service, enable it if at least one
+    device instance with that storage_key is enabled; disable it otherwise.
+    """
     try:
         from flocks.config.config_writer import ConfigWriter
         from flocks.tool.registry import ToolRegistry
 
+        # Aggregate enabled state per storage_key
+        key_enabled: Dict[str, bool] = defaultdict(bool)
         async with Storage.connect(Storage.get_db_path()) as db:
-            cur = await db.execute(
-                "SELECT COUNT(*) FROM device_integrations WHERE service_id = ? AND enabled = 1",
+            async with db.execute(
+                "SELECT storage_key, enabled FROM device_integrations WHERE service_id = ?",
                 (service_id,),
-            )
-            row = await cur.fetchone()
-            enabled_count = int(row[0]) if row else 0
+            ) as cur:
+                rows = await cur.fetchall()
 
-            cur2 = await db.execute(
-                "SELECT DISTINCT storage_key FROM device_integrations WHERE service_id = ?",
-                (service_id,),
-            )
-            storage_keys = [r[0] for r in await cur2.fetchall()]
+        for row in rows:
+            sk, enabled = row[0], bool(row[1])
+            # OR logic within each storage_key group
+            key_enabled[sk] = key_enabled[sk] or enabled
 
-        should_enable = enabled_count > 0
-        for sk in storage_keys:
+        for sk, should_enable in key_enabled.items():
             existing = ConfigWriter.get_api_service_raw(sk)
             entry = existing if isinstance(existing, dict) else {}
             entry["enabled"] = should_enable
@@ -46,9 +52,7 @@ async def sync_service_tool_state(service_id: str) -> None:
 
         log.info("tool.device.sync", {
             "service_id": service_id,
-            "enabled_devices": enabled_count,
-            "tools_enabled": should_enable,
-            "storage_keys": storage_keys,
+            "storage_keys": {k: v for k, v in key_enabled.items()},
         })
     except Exception as exc:
         log.warn("tool.device.sync.failed", {"service_id": service_id, "error": str(exc)})

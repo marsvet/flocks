@@ -1299,8 +1299,13 @@ class SessionRunner:
     async def _build_system_prompts(self, agent: AgentInfo) -> List[str]:
         """Build system prompts."""
         tool_revision = ToolRegistry.revision()
+        try:
+            from flocks.tool.device.store import device_revision as _device_revision
+            dev_rev = _device_revision()
+        except Exception:
+            dev_rev = 0
         cache_key = (
-            f"system_prompts:{self.session.id}:{agent.name}:{self.provider_id}:{self.model_id}:{tool_revision}"
+            f"system_prompts:{self.session.id}:{agent.name}:{self.provider_id}:{self.model_id}:{tool_revision}:{dev_rev}"
         )
         cached = self._static_cache.get(cache_key)
         if cached is not None:
@@ -1346,6 +1351,26 @@ class SessionRunner:
         # Agent-specific prompt (if any)
         if agent.prompt:
             prompts.append(agent.prompt)
+
+        # Device asset context: inject a brief hint so the Agent knows to use
+        # the `device_context` tool when the user asks about specific devices.
+        # Full detail (机房→设备→工具) is returned by that tool on demand,
+        # keeping the system prompt lean and avoiding duplication with the
+        # tool catalog that already lists every enabled API tool.
+        try:
+            from flocks.tool.device.store import list_devices
+            _devices = await list_devices()
+            _enabled = [d for d in _devices if d.enabled]
+            if _enabled:
+                _hint = (
+                    f"## 安全设备资产\n\n"
+                    f"当前共接入 {len(_enabled)} 台安全设备（共 {len(_devices)} 台）。"
+                    "调用 `device_context` 工具可查看机房结构、设备名称与对应工具列表，"
+                    "操作特定设备前请先确认其工具前缀。"
+                )
+                prompts.append(_hint)
+        except Exception as _dev_hint_err:
+            log.warn("runner.device_hint_failed", {"error": str(_dev_hint_err)})
 
         # Sandbox runtime context for better tool/path awareness
         sandbox_prompt = await self._build_sandbox_prompt(agent)

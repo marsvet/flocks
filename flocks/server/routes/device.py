@@ -201,10 +201,12 @@ async def route_delete_device(device_id: str):
     row = await fetch_device(device_id)
     if row is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Device not found")
+    service_id: str = row["service_id"]
     db_fields: dict = json.loads(row["fields"] or "{}")
+
     delete_secrets(device_id, db_fields)
     await delete_device_row(device_id)
-    await sync_service_tool_state(row["service_id"])
+    await sync_service_tool_state(service_id)
 
 
 @router.post("/{device_id}/test", response_model=DeviceTestResult)

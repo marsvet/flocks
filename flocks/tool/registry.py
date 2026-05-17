@@ -748,7 +748,20 @@ class ToolRegistry:
             "params": list(kwargs.keys()),
         })
 
-        result = await tool.execute(ctx, **kwargs)
+        # Method-A: if caller passes device_id, activate per-device credential override.
+        device_id = kwargs.pop("device_id", None)
+        if device_id:
+            from flocks.tool.credential_context import activate_device_credentials
+            async with activate_device_credentials(device_id) as activated:
+                if not activated:
+                    return ToolResult(
+                        success=False,
+                        error=f"设备 {device_id!r} 未找到或已禁用，请通过 device_context 工具确认 device_id 是否正确。",
+                    )
+                result = await tool.execute(ctx, **kwargs)
+        else:
+            result = await tool.execute(ctx, **kwargs)
+
         if result.success:
             cls._reset_failure_state(tool_name)
         else:
@@ -1217,6 +1230,8 @@ class ToolRegistry:
             ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "batch", "session_manage", "slash_command", "tool_search"]),
             # skill/ — skill management (search, install, status, deps, remove)
             ("flocks.tool.skill", ["flocks_skills"]),
+            # device/ — security device asset context
+            ("flocks.tool.device", ["device_context_tool"]),
             # channel/ — IM platform messaging
             ("flocks.tool.channel", ["channel_message"]),
             # wecom/ — 企业微信 MCP（文档、智能表格）

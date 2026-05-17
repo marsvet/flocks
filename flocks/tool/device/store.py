@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,24 @@ from .models import (
 from .secrets import mask_for_display, resolve_for_runtime
 
 log = Log.create(service="tool.device.store")
+
+# ---------------------------------------------------------------------------
+# Device revision counter – incremented on every write so callers (e.g. the
+# session runner's system-prompt cache) know when to rebuild device context.
+# ---------------------------------------------------------------------------
+_revision_lock = threading.Lock()
+_device_revision: int = 0
+
+
+def device_revision() -> int:
+    """Return the current device revision (monotonically increasing integer)."""
+    return _device_revision
+
+
+def _bump_revision() -> None:
+    global _device_revision
+    with _revision_lock:
+        _device_revision += 1
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +146,7 @@ async def create_group(name: str, description: Optional[str], sort_order: int) -
             "SELECT * FROM device_groups WHERE id = ?", (group_id,)
         ) as cur:
             row = await cur.fetchone()
+    _bump_revision()
     return row_to_group(row)
 
 
@@ -148,6 +168,7 @@ async def update_group(
             (new_name, new_desc, new_sort, _now_ms(), group_id),
         )
         await db.commit()
+    _bump_revision()
     return await get_group(group_id)
 
 
@@ -162,6 +183,7 @@ async def delete_group(group_id: str) -> int:
         if device_count == 0:
             await db.execute("DELETE FROM device_groups WHERE id = ?", (group_id,))
             await db.commit()
+            _bump_revision()
     return device_count
 
 
@@ -230,6 +252,7 @@ async def insert_device(
             ),
         )
         await db.commit()
+    _bump_revision()
 
 
 async def update_device_row(
@@ -252,12 +275,14 @@ async def update_device_row(
              json.dumps(db_fields), _now_ms(), device_id),
         )
         await db.commit()
+    _bump_revision()
 
 
 async def delete_device_row(device_id: str) -> None:
     async with Storage.connect(Storage.get_db_path()) as db:
         await db.execute("DELETE FROM device_integrations WHERE id = ?", (device_id,))
         await db.commit()
+    _bump_revision()
 
 
 async def record_test_result(
@@ -301,6 +326,7 @@ async def ensure_default_group() -> None:
             (DEFAULT_GROUP_ID, DEFAULT_GROUP_NAME, "默认机房，可重命名", now, now),
         )
         await db.commit()
+        _bump_revision()
     log.info("tool.device.default_group.created", {"id": DEFAULT_GROUP_ID})
 
 

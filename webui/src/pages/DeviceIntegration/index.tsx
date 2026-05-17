@@ -3,7 +3,7 @@ import {
   Shield, CheckCircle, XCircle, AlertTriangle, RefreshCw,
   Plug, PlugZap, WifiOff, Plus, Settings, Loader2,
   Eye, EyeOff, Save, Trash2, Activity, X, Server, Pencil, Check,
-  Wrench, ChevronRight,
+  Wrench, ChevronRight, ChevronLeft,
 } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
@@ -21,17 +21,18 @@ import ToolDetailModal from '../Tool/components/ToolDetailModal';
 interface DeviceVendor {
   id: string;
   nameCn: string;
+  nameEn: string;
   color: string;
   serviceIdPrefixes: string[];
 }
 
 const VENDORS: DeviceVendor[] = [
-  { id: 'sangfor',    nameCn: '深信服', color: 'bg-blue-100 text-blue-800',     serviceIdPrefixes: ['sangfor'] },
-  { id: 'nsfocus',    nameCn: '绿盟',   color: 'bg-green-100 text-green-800',   serviceIdPrefixes: ['ngsoc', 'ngtip'] },
-  { id: 'qianxin',    nameCn: '奇安信', color: 'bg-purple-100 text-purple-800', serviceIdPrefixes: ['onesec', 'onesig'] },
-  { id: 'threatbook', nameCn: '微步',   color: 'bg-orange-100 text-orange-800', serviceIdPrefixes: ['tdp'] },
-  { id: 'qingteng',   nameCn: '青藤',   color: 'bg-teal-100 text-teal-800',     serviceIdPrefixes: ['qingteng'] },
-  { id: 'skyeye',     nameCn: '天眼',   color: 'bg-cyan-100 text-cyan-800',     serviceIdPrefixes: ['skyeye'] },
+  { id: 'sangfor',    nameCn: '深信服', nameEn: 'Sangfor',    color: 'bg-blue-100 text-blue-800',     serviceIdPrefixes: ['sangfor'] },
+  { id: 'nsfocus',    nameCn: '绿盟',   nameEn: 'NSFOCUS',    color: 'bg-green-100 text-green-800',   serviceIdPrefixes: ['ngsoc', 'ngtip'] },
+  { id: 'qianxin',   nameCn: '奇安信', nameEn: 'Qi-AnXin',   color: 'bg-purple-100 text-purple-800', serviceIdPrefixes: ['onesec', 'onesig'] },
+  { id: 'threatbook', nameCn: '微步',   nameEn: 'ThreatBook',  color: 'bg-orange-100 text-orange-800', serviceIdPrefixes: ['tdp'] },
+  { id: 'qingteng',   nameCn: '青藤',   nameEn: 'Qingteng',   color: 'bg-teal-100 text-teal-800',     serviceIdPrefixes: ['qingteng'] },
+  { id: 'skyeye',     nameCn: '天眼',   nameEn: 'SkyEye',     color: 'bg-cyan-100 text-cyan-800',     serviceIdPrefixes: ['skyeye'] },
 ];
 
 function getVendor(serviceId: string): DeviceVendor | undefined {
@@ -107,47 +108,158 @@ function ActiveCard({ device, selected, onClick }: {
 }
 
 // ============================================================================
-// Available template card
+// Add device wizard panel (step 1: vendor, step 2: product)
 // ============================================================================
 
-function TemplateCard({ service, instanceCount, onAdd }: {
-  service: APIServiceSummary;
-  instanceCount: number;
-  onAdd: () => void;
+function AddDeviceWizardPanel({ templates, instanceCounts, initialVendor, onSelect, onClose }: {
+  templates: APIServiceSummary[];
+  instanceCounts: Record<string, number>;
+  initialVendor?: DeviceVendor;
+  onSelect: (template: APIServiceSummary) => void;
+  onClose: () => void;
 }) {
-  const vendor = getVendor(service.id);
-  const description = service.description_cn || service.description || '';
+  const [selectedVendor, setSelectedVendor] = useState<DeviceVendor | null>(initialVendor ?? null);
+
+  const availableVendors = useMemo(
+    () => VENDORS.filter((v) => templates.some((t) => getVendor(t.id)?.id === v.id)),
+    [templates],
+  );
+
+  const vendorTotalCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    VENDORS.forEach((v) => {
+      counts[v.id] = templates
+        .filter((t) => getVendor(t.id)?.id === v.id)
+        .reduce((sum, t) => sum + (instanceCounts[t.id] ?? 0), 0);
+    });
+    return counts;
+  }, [templates, instanceCounts]);
+
+  const vendorTemplates = useMemo(
+    () => (selectedVendor ? templates.filter((t) => getVendor(t.id)?.id === selectedVendor.id) : []),
+    [templates, selectedVendor],
+  );
+
   return (
-    <div className="rounded-xl border border-zinc-100 bg-white/60 p-4 transition-all duration-150">
-      <div className="flex items-start gap-3">
-        <div className="w-9 h-9 rounded-xl bg-zinc-100 flex items-center justify-center flex-shrink-0">
-          <Plug className="w-4 h-4 text-zinc-400" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-sm font-medium text-zinc-600 truncate">{service.name}</p>
-            {service.version && <span className="text-[10px] text-zinc-400 flex-shrink-0">v{service.version}</span>}
-          </div>
-          {description && (
-            <p className="text-xs text-zinc-400 line-clamp-2 mt-1 leading-relaxed">{description}</p>
-          )}
-          <div className="flex items-center justify-between mt-3">
-            <div className="flex items-center gap-1.5">
-              {vendor && <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${vendor.color}`}>{vendor.nameCn}</span>}
-              {instanceCount > 0 && (
-                <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded-md font-medium">
-                  已有 {instanceCount} 台
+    <div className="fixed inset-y-0 right-0 flex items-start justify-end z-40 pointer-events-none">
+      <div
+        className="pointer-events-auto bg-white shadow-2xl border-l border-zinc-200 flex flex-col"
+        style={{ width: 440, marginTop: 64, height: 'calc(100vh - 64px)' }}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-100 flex-shrink-0">
+          <div className="flex items-center gap-2.5">
+            {selectedVendor && (
+              <button
+                onClick={() => setSelectedVendor(null)}
+                className="p-1.5 rounded-lg hover:bg-zinc-100 text-zinc-500 hover:text-zinc-700 transition-colors"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+            )}
+            <div>
+              <h3 className="text-sm font-semibold text-zinc-900">
+                {selectedVendor ? `选择 ${selectedVendor.nameCn} 设备` : '添加设备'}
+              </h3>
+              <div className="flex items-center gap-1.5 mt-0.5">
+                {/* Breadcrumb */}
+                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${!selectedVendor ? 'bg-blue-100 text-blue-700' : 'bg-zinc-100 text-zinc-500'}`}>
+                  1 选择厂商
                 </span>
-              )}
+                <ChevronRight className="w-2.5 h-2.5 text-zinc-300" />
+                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-full ${selectedVendor ? 'bg-blue-100 text-blue-700' : 'bg-zinc-100 text-zinc-400'}`}>
+                  2 选择设备
+                </span>
+                <ChevronRight className="w-2.5 h-2.5 text-zinc-300" />
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-zinc-100 text-zinc-400">
+                  3 填写配置
+                </span>
+              </div>
             </div>
-            <button
-              onClick={onAdd}
-              className="flex items-center gap-1 text-xs font-medium px-2.5 py-1 rounded-lg transition-colors text-blue-600 hover:text-blue-700 bg-blue-50 hover:bg-blue-100"
-            >
-              <Plus className="w-3 h-3" />
-              {instanceCount > 0 ? '再接入' : '接入'}
-            </button>
           </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-zinc-100 text-zinc-400 hover:text-zinc-600">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-5">
+          {!selectedVendor ? (
+            /* Step 1: Vendor selection */
+            <>
+              <p className="text-xs text-zinc-400 mb-4">选择设备所属厂商，共 {availableVendors.length} 家</p>
+              <div className="grid grid-cols-2 gap-3">
+                {availableVendors.map((vendor) => {
+                  const count = vendorTotalCounts[vendor.id] ?? 0;
+                  const productCount = templates.filter((t) => getVendor(t.id)?.id === vendor.id).length;
+                  return (
+                    <button
+                      key={vendor.id}
+                      onClick={() => setSelectedVendor(vendor)}
+                      className="flex flex-col items-center gap-2.5 p-5 rounded-xl border border-zinc-200 bg-white hover:border-blue-300 hover:bg-blue-50/40 transition-all duration-150 group"
+                    >
+                      <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-lg font-bold ${vendor.color}`}>
+                        {vendor.nameCn[0]}
+                      </div>
+                      <div className="text-center">
+                        <p className="text-sm font-semibold text-zinc-800">{vendor.nameCn}</p>
+                        <p className="text-xs text-zinc-400">{vendor.nameEn}</p>
+                        <p className="text-[10px] text-zinc-400 mt-0.5">
+                          {productCount} 种设备
+                          {count > 0 && <span className="text-blue-600 font-medium"> · 已接入 {count} 台</span>}
+                        </p>
+                      </div>
+                      <ChevronRight className="w-3.5 h-3.5 text-zinc-300 group-hover:text-blue-400 transition-colors" />
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            /* Step 2: Product selection */
+            <>
+              <p className="text-xs text-zinc-400 mb-4">
+                共 {vendorTemplates.length} 款设备，同款设备可多次接入
+              </p>
+              <div className="space-y-2">
+                {vendorTemplates.map((tpl) => {
+                  const count = instanceCounts[tpl.id] ?? 0;
+                  return (
+                    <button
+                      key={tpl.id}
+                      onClick={() => onSelect(tpl)}
+                      className="w-full text-left flex items-start gap-3 px-4 py-3.5 rounded-xl border border-zinc-100 bg-white hover:border-blue-200 hover:bg-blue-50/30 transition-all group"
+                    >
+                      <div className="w-9 h-9 rounded-xl bg-zinc-50 group-hover:bg-blue-50 flex items-center justify-center flex-shrink-0 transition-colors">
+                        <Plug className="w-4 h-4 text-zinc-400 group-hover:text-blue-500 transition-colors" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <p className="text-sm font-medium text-zinc-800 leading-snug">{tpl.name}</p>
+                          {tpl.version && (
+                            <span className="text-[10px] text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded-md flex-shrink-0 mt-0.5">
+                              v{tpl.version}
+                            </span>
+                          )}
+                        </div>
+                        {(tpl.description_cn || tpl.description) && (
+                          <p className="text-xs text-zinc-400 mt-0.5 line-clamp-2 leading-relaxed">
+                            {tpl.description_cn || tpl.description}
+                          </p>
+                        )}
+                        {count > 0 && (
+                          <span className="inline-block mt-1.5 text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded-md font-medium">
+                            已接入 {count} 台
+                          </span>
+                        )}
+                      </div>
+                      <ChevronRight className="w-4 h-4 text-zinc-300 group-hover:text-blue-400 flex-shrink-0 mt-2 transition-colors" />
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -155,7 +267,7 @@ function TemplateCard({ service, instanceCount, onAdd }: {
 }
 
 // ============================================================================
-// Add / Edit device panel (right side)
+// Device config panel (add / edit)
 // ============================================================================
 
 type PanelTab = 'config' | 'tools' | 'overview';
@@ -172,15 +284,16 @@ function Toggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   );
 }
 
-function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest }: {
+function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest, onBack }: {
   device?: DeviceIntegration;
   template?: APIServiceSummary;
   onSave: (data: { name: string; fields: Record<string, string>; enabled: boolean; verify_ssl: boolean }) => Promise<void>;
   onDelete?: () => Promise<void>;
   onClose: () => void;
   onTest?: () => Promise<{ success: boolean; message: string }>;
+  onBack?: () => void;
 }) {
-  const { toast } = useToast();
+  const toast = useToast();
   const [tab, setTab] = useState<PanelTab>('config');
   const [name, setName] = useState(device?.name ?? '');
   const [fields, setFields] = useState<Record<string, string>>(() => device ? { ...device.fields } : {});
@@ -300,7 +413,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
 
   return (
     <>
-      {/* Slide-in drawer: fixed on right side, max-height so it doesn't occupy full page */}
       <div className="fixed inset-y-0 right-0 flex items-start justify-end z-40 pointer-events-none">
         <div
           className="pointer-events-auto bg-white shadow-2xl border-l border-zinc-200 flex flex-col"
@@ -308,12 +420,17 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
         >
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-100 flex-shrink-0">
-            <div className="flex items-center gap-3 min-w-0">
+            <div className="flex items-center gap-2.5 min-w-0">
+              {onBack && (
+                <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-zinc-100 text-zinc-500 hover:text-zinc-700 transition-colors flex-shrink-0">
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+              )}
               <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 ${device ? 'bg-blue-50' : 'bg-zinc-50'}`}>
                 {device ? <PlugZap className="w-4 h-4 text-blue-500" /> : <Plus className="w-4 h-4 text-zinc-400" />}
               </div>
               <div className="min-w-0">
-                <h3 className="text-sm font-semibold text-zinc-900 truncate">{device ? device.name : '接入新设备'}</h3>
+                <h3 className="text-sm font-semibold text-zinc-900 truncate">{device ? device.name : '填写配置'}</h3>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   {vendor && <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${vendor.color}`}>{vendor.nameCn}</span>}
                   <span className="text-xs text-zinc-400 truncate">{device?.storage_key ?? template?.id}</span>
@@ -348,7 +465,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
             {/* ── 配置 tab ── */}
             {tab === 'config' && (
               <div className="px-5 py-4 space-y-4">
-                {/* Device name */}
                 <div>
                   <label className="block text-xs font-semibold text-zinc-500 mb-1.5">
                     设备名称 <span className="text-red-500">*</span>
@@ -362,7 +478,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
                   />
                 </div>
 
-                {/* Credential fields */}
                 {credFields.length > 0 && (
                   <div className="space-y-3">
                     <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">连接参数</p>
@@ -404,7 +519,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
                   </div>
                 )}
 
-                {/* Toggles */}
                 <div className="rounded-xl border border-zinc-100 divide-y divide-zinc-100">
                   <div className="flex items-center justify-between px-4 py-3">
                     <div>
@@ -422,7 +536,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
                   </div>
                 </div>
 
-                {/* Test result */}
                 {testResult && (
                   <div className={`rounded-lg px-4 py-3 text-sm flex items-start gap-2 ${
                     testResult.success ? 'bg-green-50 text-green-700 border border-green-100' : 'bg-red-50 text-red-600 border border-red-100'
@@ -434,7 +547,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
                   </div>
                 )}
 
-                {/* Actions */}
                 <div className="space-y-2 pt-1">
                   <div className="flex gap-2">
                     {device && onTest && (
@@ -568,7 +680,6 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
         </div>
       </div>
 
-      {/* ToolDetailModal overlay */}
       {toolModal && (
         <ToolDetailModal
           tool={toolModal}
@@ -588,7 +699,7 @@ function GroupBanner({ group, onRenamed }: {
   group: DeviceGroup | undefined;
   onRenamed: () => void;
 }) {
-  const { toast } = useToast();
+  const toast = useToast();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(group?.name ?? '');
   const [saving, setSaving] = useState(false);
@@ -671,12 +782,13 @@ function GroupBanner({ group, onRenamed }: {
 // ============================================================================
 
 type PanelMode =
-  | { kind: 'edit'; device: DeviceIntegration }
+  | { kind: 'wizard'; initialVendor?: DeviceVendor }
   | { kind: 'add'; template: APIServiceSummary }
+  | { kind: 'edit'; device: DeviceIntegration }
   | null;
 
 export default function DeviceIntegrationPage() {
-  const { toast } = useToast();
+  const toast = useToast();
   const [devices, setDevices] = useState<DeviceIntegration[]>([]);
   const [templates, setTemplates] = useState<APIServiceSummary[]>([]);
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
@@ -684,9 +796,6 @@ export default function DeviceIntegrationPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [panel, setPanel] = useState<PanelMode>(null);
 
-  // Current product locks to a single room. Pick the first group as "the"
-  // room; rename actions target it. Multi-room UI lights up automatically
-  // when ``groups.length > 1`` (i.e. backend ``MULTI_GROUP_ENABLED`` is on).
   const currentGroup: DeviceGroup | undefined = groups[0];
 
   const fetchData = useCallback(async (silent = false) => {
@@ -707,11 +816,12 @@ export default function DeviceIntegrationPage() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [toast]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => { void fetchData(); }, [fetchData]);
 
-  // Count instances per storage_key
+  // Count instances per storage_key (for wizard display)
   const instanceCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     devices.forEach((d) => { counts[d.storage_key] = (counts[d.storage_key] || 0) + 1; });
@@ -741,7 +851,6 @@ export default function DeviceIntegrationPage() {
     }
     await fetchData(true);
     if (panel?.kind === 'edit') {
-      // Refresh the panel device
       const updated = await deviceAPI.get(panel.device.id);
       setPanel({ kind: 'edit', device: updated.data });
     }
@@ -765,8 +874,6 @@ export default function DeviceIntegrationPage() {
     return res.data;
   };
 
-  const showPanel = panel !== null;
-
   return (
     <div className="h-full flex flex-col">
       <PageHeader
@@ -774,14 +881,23 @@ export default function DeviceIntegrationPage() {
         description="配置安全设备 API 连接，使 Flocks 能够直接调用和控制这些设备"
         icon={<Shield className="w-5 h-5" />}
         action={
-          <button
-            onClick={() => void fetchData(true)}
-            disabled={refreshing}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg border border-zinc-200 text-zinc-600 hover:bg-zinc-50 transition-colors"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-            刷新
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => void fetchData(true)}
+              disabled={refreshing}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg border border-zinc-200 text-zinc-600 hover:bg-zinc-50 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+              刷新
+            </button>
+            <button
+              onClick={() => setPanel({ kind: 'wizard' })}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors font-medium"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              添加设备
+            </button>
+          </div>
         }
       />
 
@@ -790,88 +906,78 @@ export default function DeviceIntegrationPage() {
       {loading ? (
         <div className="flex-1 flex items-center justify-center"><LoadingSpinner /></div>
       ) : (
-        <div className="flex-1 flex overflow-hidden">
-          {/* Device list always takes full width; panel floats on top */}
-          <div className="flex flex-col overflow-hidden w-full">
-            <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
-
-              {/* ── 已接入设备 ── */}
-              <section>
-                <div className="flex items-center gap-2 mb-4">
-                  <PlugZap className="w-4 h-4 text-blue-600" />
-                  <h3 className="text-sm font-semibold text-zinc-800">已接入设备</h3>
-                  <span className="text-xs text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded-md">{devices.length}</span>
-                  {devices.filter((d) => d.status === 'ok' || d.status === 'connected').length > 0 && (
-                    <span className="text-xs text-green-600">
-                      {devices.filter((d) => d.status === 'ok' || d.status === 'connected').length} 已连接
-                    </span>
-                  )}
-                </div>
-
-                {devices.length === 0 ? (
-                  <div className="rounded-xl border-2 border-dashed border-zinc-200 bg-zinc-50/50 px-6 py-10 text-center">
-                    <WifiOff className="w-8 h-8 text-zinc-300 mx-auto mb-2" />
-                    <p className="text-sm text-zinc-500 font-medium">暂无已接入的设备</p>
-                    <p className="text-xs text-zinc-400 mt-1">从下方"可接入设备"中选择并配置</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                    {devices.map((d) => (
-                      <ActiveCard
-                        key={d.id}
-                        device={d}
-                        selected={panelDeviceId === d.id}
-                        onClick={() => setPanel({ kind: 'edit', device: d })}
-                      />
-                    ))}
-                  </div>
-                )}
-              </section>
-
-              {/* ── 可接入设备目录 ── */}
-              {templates.length > 0 && (
-                <section>
-                  <div className="flex items-center gap-2 mb-4">
-                    <Plug className="w-4 h-4 text-zinc-400" />
-                    <h3 className="text-sm font-semibold text-zinc-500">可接入设备</h3>
-                    <span className="text-xs text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded-md">{templates.length}</span>
-                    <span className="text-xs text-zinc-400">· 同一类型可多次接入</span>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                    {templates.map((tpl) => (
-                      <TemplateCard
-                        key={tpl.id}
-                        service={tpl}
-                        instanceCount={instanceCounts[tpl.id] ?? 0}
-                        onAdd={() => setPanel({ kind: 'add', template: tpl })}
-                      />
-                    ))}
-                  </div>
-                </section>
-              )}
-
-              {templates.length === 0 && devices.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-20 text-zinc-400 gap-3">
-                  <Loader2 className="w-8 h-8 opacity-40 animate-spin" />
-                  <p className="text-sm">暂无设备数据，请重启后端服务后刷新</p>
-                </div>
-              )}
+        <div className="flex-1 overflow-y-auto px-6 py-6">
+          {devices.length === 0 ? (
+            /* Empty state */
+            <div className="flex flex-col items-center justify-center py-24 gap-4">
+              <div className="w-16 h-16 rounded-2xl bg-zinc-100 flex items-center justify-center">
+                <PlugZap className="w-7 h-7 text-zinc-300" />
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-semibold text-zinc-700">暂无已接入的设备</p>
+                <p className="text-xs text-zinc-400 mt-1.5">添加设备后，Flocks Agent 即可调用对应工具</p>
+              </div>
+              <button
+                onClick={() => setPanel({ kind: 'wizard' })}
+                className="flex items-center gap-1.5 px-4 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors font-medium"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                立即添加设备
+              </button>
             </div>
-          </div>
-
-          {/* Config panel rendered as fixed drawer overlay */}
-          {showPanel && (
-            <DeviceConfigPanel
-              key={panel.kind === 'edit' ? panel.device.id : panel.template.id}
-              device={panel.kind === 'edit' ? panel.device : undefined}
-              template={panel.kind === 'add' ? panel.template : undefined}
-              onSave={handleSave}
-              onDelete={panel.kind === 'edit' ? handleDelete : undefined}
-              onClose={() => setPanel(null)}
-              onTest={panel.kind === 'edit' ? handleTest : undefined}
-            />
+          ) : (
+            <section>
+              <div className="flex items-center gap-2 mb-4">
+                <PlugZap className="w-4 h-4 text-blue-600" />
+                <h3 className="text-sm font-semibold text-zinc-800">已接入设备</h3>
+                <span className="text-xs text-zinc-400 bg-zinc-100 px-1.5 py-0.5 rounded-md">{devices.length}</span>
+                {devices.filter((d) => d.status === 'ok' || d.status === 'connected').length > 0 && (
+                  <span className="text-xs text-green-600">
+                    {devices.filter((d) => d.status === 'ok' || d.status === 'connected').length} 已连接
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                {devices.map((d) => (
+                  <ActiveCard
+                    key={d.id}
+                    device={d}
+                    selected={panelDeviceId === d.id}
+                    onClick={() => setPanel({ kind: 'edit', device: d })}
+                  />
+                ))}
+              </div>
+            </section>
           )}
         </div>
+      )}
+
+      {/* Wizard panel (vendor → product selection) */}
+      {panel?.kind === 'wizard' && (
+        <AddDeviceWizardPanel
+          templates={templates}
+          instanceCounts={instanceCounts}
+          initialVendor={panel.initialVendor}
+          onSelect={(tpl) => setPanel({ kind: 'add', template: tpl })}
+          onClose={() => setPanel(null)}
+        />
+      )}
+
+      {/* Config panel (add or edit) */}
+      {(panel?.kind === 'add' || panel?.kind === 'edit') && (
+        <DeviceConfigPanel
+          key={panel.kind === 'edit' ? panel.device.id : panel.template.id}
+          device={panel.kind === 'edit' ? panel.device : undefined}
+          template={panel.kind === 'add' ? panel.template : undefined}
+          onSave={handleSave}
+          onDelete={panel.kind === 'edit' ? handleDelete : undefined}
+          onClose={() => setPanel(null)}
+          onTest={panel.kind === 'edit' ? handleTest : undefined}
+          onBack={panel.kind === 'add'
+            ? () => setPanel({ kind: 'wizard', initialVendor: getVendor(panel.template.id) })
+            : undefined
+          }
+        />
       )}
     </div>
   );
