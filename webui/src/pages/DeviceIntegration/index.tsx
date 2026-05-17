@@ -1,15 +1,18 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   Shield, CheckCircle, XCircle, AlertTriangle, RefreshCw,
   Plug, PlugZap, WifiOff, Plus, Settings, Loader2,
   Eye, EyeOff, Save, Trash2, Activity, X, Server, Pencil, Check,
+  Wrench, ChevronRight,
 } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
 import { useToast } from '@/components/common/Toast';
 import { providerAPI } from '@/api/provider';
 import { deviceAPI, type DeviceIntegration, type DeviceGroup } from '@/api/device';
-import type { APIServiceSummary, APIServiceCredentialField } from '@/types';
+import type { APIServiceSummary, APIServiceCredentialField, Tool } from '@/types';
+import { toolAPI } from '@/api/tool';
+import ToolDetailModal from '../Tool/components/ToolDetailModal';
 
 // ============================================================================
 // Vendor catalog
@@ -155,24 +158,32 @@ function TemplateCard({ service, instanceCount, onAdd }: {
 // Add / Edit device panel (right side)
 // ============================================================================
 
+type PanelTab = 'config' | 'tools' | 'overview';
+
+function Toggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${on ? 'bg-blue-500' : 'bg-zinc-300'}`}
+    >
+      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${on ? 'translate-x-4' : 'translate-x-0.5'}`} />
+    </button>
+  );
+}
+
 function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest }: {
-  device?: DeviceIntegration;           // existing → edit mode
-  template?: APIServiceSummary;         // new from template → add mode
+  device?: DeviceIntegration;
+  template?: APIServiceSummary;
   onSave: (data: { name: string; fields: Record<string, string>; enabled: boolean; verify_ssl: boolean }) => Promise<void>;
   onDelete?: () => Promise<void>;
   onClose: () => void;
   onTest?: () => Promise<{ success: boolean; message: string }>;
 }) {
   const { toast } = useToast();
+  const [tab, setTab] = useState<PanelTab>('config');
   const [name, setName] = useState(device?.name ?? '');
-  // ``fields`` holds *user-pending* input. For edit mode, sensitive fields
-  // start empty (their existing masked preview is shown via placeholder
-  // and is preserved server-side when the user leaves the input blank).
-  // Non-sensitive fields start populated with the saved value.
-  const [fields, setFields] = useState<Record<string, string>>(() => {
-    if (!device) return {};
-    return { ...device.fields };
-  });
+  const [fields, setFields] = useState<Record<string, string>>(() => device ? { ...device.fields } : {});
   const [enabled, setEnabled] = useState(device?.enabled ?? true);
   const [verifySsl, setVerifySsl] = useState(device?.verify_ssl ?? false);
   const [saving, setSaving] = useState(false);
@@ -182,40 +193,66 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [credFields, setCredFields] = useState<APIServiceCredentialField[]>([]);
   const [visibility, setVisibility] = useState<Record<string, boolean>>({});
+  const [serviceTools, setServiceTools] = useState<Tool[]>([]);
+  const [toolModal, setToolModal] = useState<Tool | null>(null);
+  const [metadata, setMetadata] = useState<{ name?: string; version?: string; description?: string; description_cn?: string; docs_url?: string } | null>(null);
+  const [toolEnabled, setToolEnabled] = useState<Record<string, boolean>>({});
+  const originalMasked = useRef<Record<string, string>>({});
 
-  // Load credential schema from template
+  const serviceId = device?.service_id ?? template?.id ?? '';
+  const vendor = getVendor(serviceId);
+
   useEffect(() => {
-    const key = device?.storage_key ?? template?.id;
-    if (!key) return;
-    providerAPI.getServiceMetadata(key)
+    if (!serviceId) return;
+    providerAPI.getServiceMetadata(serviceId)
       .then((res) => {
-        const schema: APIServiceCredentialField[] = res.data?.credential_schema ?? [];
+        const meta = res.data;
+        setMetadata(meta ?? null);
+        const schema: APIServiceCredentialField[] = meta?.credential_schema ?? [];
         setCredFields(schema);
         if (device) {
-          // Edit mode: clear all sensitive fields' input so the masked
-          // preview shines through as placeholder and "blank = keep" works.
-          setFields((prev) => {
-            const next = { ...prev };
-            schema.forEach((f) => {
-              if (f.storage === 'secret') next[f.key] = '';
-            });
-            return next;
+          const masked: Record<string, string> = {};
+          schema.forEach((f) => {
+            if (f.storage === 'secret' || f.input_type === 'password') {
+              masked[f.key] = device.fields?.[f.key] ?? '';
+            }
           });
+          originalMasked.current = masked;
+          setFields({ ...device.fields });
         } else {
-          // Add mode: pre-fill defaults declared in the schema.
           const defaults: Record<string, string> = {};
           schema.forEach((f) => { if (f.default_value) defaults[f.key] = f.default_value; });
           setFields((prev) => ({ ...defaults, ...prev }));
         }
       })
-      .catch(() => setCredFields([]));
-  }, [device, template?.id]);
+      .catch(() => {});
+
+    toolAPI.list()
+      .then((res) => {
+        const matched = (res.data || []).filter(
+          (t) => t.source_name && (
+            t.source_name === serviceId ||
+            t.source_name.startsWith(serviceId + '_') ||
+            serviceId.startsWith(t.source_name)
+          )
+        );
+        setServiceTools(matched);
+        const initEnabled: Record<string, boolean> = {};
+        matched.forEach((t) => { initEnabled[t.name] = t.enabled; });
+        setToolEnabled(initEnabled);
+      })
+      .catch(() => {});
+  }, [device, serviceId]);
 
   const handleSave = async () => {
     if (!name.trim()) { toast.error('请填写设备名称'); return; }
     setSaving(true);
     try {
-      await onSave({ name: name.trim(), fields, enabled, verify_ssl: verifySsl });
+      const payload: Record<string, string> = { ...fields };
+      Object.entries(originalMasked.current).forEach(([k, masked]) => {
+        if (payload[k] === masked) payload[k] = '';
+      });
+      await onSave({ name: name.trim(), fields: payload, enabled, verify_ssl: verifySsl });
       toast.success(device ? '配置已保存' : '设备已添加');
     } catch {
       toast.error('保存失败');
@@ -228,192 +265,318 @@ function DeviceConfigPanel({ device, template, onSave, onDelete, onClose, onTest
     if (!onTest) return;
     setTesting(true);
     setTestResult(null);
-    try {
-      const r = await onTest();
-      setTestResult(r);
-    } finally {
-      setTesting(false);
-    }
+    try { setTestResult(await onTest()); }
+    finally { setTesting(false); }
   };
 
   const handleDelete = async () => {
     if (!confirmDelete) {
       setConfirmDelete(true);
-      // Auto-revert the "confirm?" state after 4s so the button doesn't get
-      // stuck in armed mode forever.
       window.setTimeout(() => setConfirmDelete(false), 4000);
       return;
     }
     if (!onDelete) return;
     setDeleting(true);
+    try { await onDelete(); toast.success('已删除设备'); }
+    catch { toast.error('删除失败'); }
+    finally { setDeleting(false); }
+  };
+
+  const handleToggleTool = async (toolName: string, next: boolean) => {
     try {
-      await onDelete();
-      toast.success('已删除设备');
+      await toolAPI.setEnabled(toolName, next);
+      setToolEnabled((p) => ({ ...p, [toolName]: next }));
+      setServiceTools((prev) => prev.map((t) => t.name === toolName ? { ...t, enabled: next } : t));
     } catch {
-      toast.error('删除失败');
-    } finally {
-      setDeleting(false);
+      toast.error('操作失败');
     }
   };
 
-  const vendor = getVendor(device?.service_id ?? template?.id ?? '');
+  const TABS: { key: PanelTab; label: string; icon: React.ReactNode }[] = [
+    { key: 'config', label: '配置', icon: <Settings className="w-3.5 h-3.5" /> },
+    { key: 'tools',  label: `工具${serviceTools.length ? ` (${serviceTools.length})` : ''}`, icon: <Wrench className="w-3.5 h-3.5" /> },
+    { key: 'overview', label: '概览', icon: <AlertTriangle className="w-3.5 h-3.5 opacity-60" /> },
+  ];
 
   return (
-    <div className="h-full flex flex-col bg-white">
-      {/* Header */}
-      <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-100 flex-shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
-          <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 ${device ? 'bg-blue-100' : 'bg-zinc-100'}`}>
-            {device ? <PlugZap className="w-4 h-4 text-blue-600" /> : <Plus className="w-4 h-4 text-zinc-500" />}
-          </div>
-          <div className="min-w-0">
-            <h3 className="text-sm font-semibold text-zinc-800 truncate">{device ? '编辑设备' : '接入新设备'}</h3>
-            <div className="flex items-center gap-1.5 mt-0.5">
-              {vendor && <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${vendor.color}`}>{vendor.nameCn}</span>}
-              <span className="text-xs text-zinc-400">{device?.storage_key ?? template?.id}</span>
+    <>
+      {/* Slide-in drawer: fixed on right side, max-height so it doesn't occupy full page */}
+      <div className="fixed inset-y-0 right-0 flex items-start justify-end z-40 pointer-events-none">
+        <div
+          className="pointer-events-auto bg-white shadow-2xl border-l border-zinc-200 flex flex-col"
+          style={{ width: 480, marginTop: 64, height: 'calc(100vh - 64px)' }}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-100 flex-shrink-0">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 ${device ? 'bg-blue-50' : 'bg-zinc-50'}`}>
+                {device ? <PlugZap className="w-4 h-4 text-blue-500" /> : <Plus className="w-4 h-4 text-zinc-400" />}
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-zinc-900 truncate">{device ? device.name : '接入新设备'}</h3>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  {vendor && <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${vendor.color}`}>{vendor.nameCn}</span>}
+                  <span className="text-xs text-zinc-400 truncate">{device?.storage_key ?? template?.id}</span>
+                </div>
+              </div>
             </div>
+            <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-zinc-100 text-zinc-400 hover:text-zinc-600 flex-shrink-0">
+              <X className="w-4 h-4" />
+            </button>
           </div>
-        </div>
-        <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-zinc-100 text-zinc-400 hover:text-zinc-600 flex-shrink-0">
-          <X className="w-4 h-4" />
-        </button>
-      </div>
 
-      {/* Body */}
-      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-        {/* Device name */}
-        <div>
-          <label className="block text-xs font-semibold text-zinc-600 mb-1.5">
-            设备名称 <span className="text-red-500">*</span>
-          </label>
-          <input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="例如：总部 AF 防火墙"
-            className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-100"
-          />
-        </div>
+          {/* Tab bar */}
+          <div className="flex border-b border-zinc-100 flex-shrink-0 px-1">
+            {TABS.map(({ key, label, icon }) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+                  tab === key
+                    ? 'border-blue-500 text-blue-600'
+                    : 'border-transparent text-zinc-500 hover:text-zinc-700'
+                }`}
+              >
+                {icon}{label}
+              </button>
+            ))}
+          </div>
 
-        {/* Credential fields */}
-        {credFields.length > 0 && (
-          <div className="space-y-3">
-            <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">连接配置</p>
-            {credFields.map((f) => {
-              const isSecret = f.storage === 'secret' || f.input_type === 'password';
-              const show = !!visibility[f.key];
-              const hasExisting = !!device?.fields_set?.[f.key];
-              const existingMask = device?.fields?.[f.key] ?? '';
-              const placeholder = isSecret && hasExisting
-                ? `已配置（${existingMask}）— 留空保留`
-                : (f.default_value ?? '');
-              return (
-                <div key={f.key}>
-                  <label className="block text-xs font-medium text-zinc-600 mb-1">
-                    {f.label}
-                    {f.required && !hasExisting && <span className="text-red-500 ml-0.5">*</span>}
+          {/* Tab body */}
+          <div className="flex-1 overflow-y-auto">
+
+            {/* ── 配置 tab ── */}
+            {tab === 'config' && (
+              <div className="px-5 py-4 space-y-4">
+                {/* Device name */}
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-500 mb-1.5">
+                    设备名称 <span className="text-red-500">*</span>
                   </label>
-                  <div className="relative">
-                    <input
-                      type={isSecret && !show ? 'password' : 'text'}
-                      value={fields[f.key] ?? ''}
-                      onChange={(e) => setFields((p) => ({ ...p, [f.key]: e.target.value }))}
-                      placeholder={placeholder}
-                      className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-100 pr-10"
-                    />
-                    {isSecret && (
+                  <input
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="例如：总部 AF 防火墙"
+                    className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                  />
+                </div>
+
+                {/* Credential fields */}
+                {credFields.length > 0 && (
+                  <div className="space-y-3">
+                    <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">连接参数</p>
+                    {credFields.map((f) => {
+                      const isSecret = f.storage === 'secret' || f.input_type === 'password';
+                      const show = !!visibility[f.key];
+                      const hasExisting = !!device?.fields_set?.[f.key];
+                      return (
+                        <div key={f.key}>
+                          <label className="block text-xs font-medium text-zinc-600 mb-1">
+                            {f.label}
+                            {f.required && !hasExisting && <span className="text-red-500 ml-0.5">*</span>}
+                          </label>
+                          <div className="relative">
+                            <input
+                              type={isSecret && !show ? 'password' : 'text'}
+                              value={fields[f.key] ?? ''}
+                              onChange={(e) => setFields((p) => ({ ...p, [f.key]: e.target.value }))}
+                              placeholder={f.default_value ?? ''}
+                              className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-100 pr-10"
+                            />
+                            {isSecret && (
+                              <button
+                                type="button"
+                                onClick={() => setVisibility((p) => ({ ...p, [f.key]: !p[f.key] }))}
+                                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                              >
+                                {show ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                              </button>
+                            )}
+                          </div>
+                          {isSecret && device && hasExisting && (
+                            <p className="mt-0.5 text-[11px] text-zinc-400">已配置 · 保持不变请勿修改，清空则删除</p>
+                          )}
+                          {f.description && <p className="mt-0.5 text-xs text-zinc-400">{f.description}</p>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Toggles */}
+                <div className="rounded-xl border border-zinc-100 divide-y divide-zinc-100">
+                  <div className="flex items-center justify-between px-4 py-3">
+                    <div>
+                      <p className="text-sm font-medium text-zinc-700">SSL 验证</p>
+                      <p className="text-[11px] text-zinc-400 mt-0.5">关闭可访问自签名证书的内网设备</p>
+                    </div>
+                    <Toggle on={verifySsl} onToggle={() => setVerifySsl((v) => !v)} />
+                  </div>
+                  <div className="flex items-center justify-between px-4 py-3">
+                    <div>
+                      <p className="text-sm font-medium text-zinc-700">启用设备</p>
+                      <p className="text-[11px] text-zinc-400 mt-0.5">关闭后 Agent 不会调用此设备的工具</p>
+                    </div>
+                    <Toggle on={enabled} onToggle={() => setEnabled((v) => !v)} />
+                  </div>
+                </div>
+
+                {/* Test result */}
+                {testResult && (
+                  <div className={`rounded-lg px-4 py-3 text-sm flex items-start gap-2 ${
+                    testResult.success ? 'bg-green-50 text-green-700 border border-green-100' : 'bg-red-50 text-red-600 border border-red-100'
+                  }`}>
+                    {testResult.success
+                      ? <CheckCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                      : <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />}
+                    <span>{testResult.message}</span>
+                  </div>
+                )}
+
+                {/* Actions */}
+                <div className="space-y-2 pt-1">
+                  <div className="flex gap-2">
+                    {device && onTest && (
                       <button
-                        type="button"
-                        onClick={() => setVisibility((p) => ({ ...p, [f.key]: !p[f.key] }))}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
-                        title={show ? '隐藏' : '显示'}
+                        onClick={handleTest}
+                        disabled={testing}
+                        className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg border border-zinc-200 text-zinc-600 hover:bg-zinc-50 disabled:opacity-50 transition-colors"
                       >
-                        {show ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        {testing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
+                        连通测试
                       </button>
                     )}
+                    <button
+                      onClick={handleSave}
+                      disabled={saving}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                    >
+                      {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                      {device ? '保存配置' : '确认接入'}
+                    </button>
                   </div>
-                  {f.description && <p className="mt-1 text-xs text-zinc-400">{f.description}</p>}
+                  {device && onDelete && (
+                    <button
+                      onClick={handleDelete}
+                      disabled={deleting}
+                      className="w-full flex items-center justify-center gap-1.5 py-2 text-sm rounded-lg border border-red-100 text-red-500 hover:bg-red-50 disabled:opacity-50 transition-colors"
+                    >
+                      {deleting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                      {confirmDelete ? '确认删除此设备配置？' : '删除设备'}
+                    </button>
+                  )}
                 </div>
-              );
-            })}
-          </div>
-        )}
+              </div>
+            )}
 
-        {/* SSL + Enable toggles */}
-        <div className="space-y-3 pt-1">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-zinc-700">SSL 验证</p>
-              <p className="text-xs text-zinc-400 mt-0.5">关闭以允许自签名证书（内网设备通常需关闭）</p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setVerifySsl((v) => !v)}
-              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${verifySsl ? 'bg-blue-500' : 'bg-zinc-300'}`}
-            >
-              <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${verifySsl ? 'translate-x-4' : 'translate-x-0.5'}`} />
-            </button>
-          </div>
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-zinc-700">启用设备</p>
-              <p className="text-xs text-zinc-400 mt-0.5">关闭后不会调用此设备的 API</p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setEnabled((v) => !v)}
-              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${enabled ? 'bg-blue-500' : 'bg-zinc-300'}`}
-            >
-              <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
-            </button>
+            {/* ── 工具 tab ── */}
+            {tab === 'tools' && (
+              <div className="px-5 py-4">
+                {serviceTools.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-16 text-zinc-400 gap-2">
+                    <Wrench className="w-8 h-8 opacity-30" />
+                    <p className="text-sm">暂无关联工具</p>
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-zinc-100 overflow-hidden">
+                    <table className="w-full table-fixed divide-y divide-zinc-100">
+                      <thead className="bg-zinc-50">
+                        <tr>
+                          <th className="w-[38%] px-4 py-2.5 text-left text-xs font-medium text-zinc-500">工具名称</th>
+                          <th className="px-4 py-2.5 text-left text-xs font-medium text-zinc-500">描述</th>
+                          <th className="w-[72px] px-4 py-2.5 text-left text-xs font-medium text-zinc-500">状态</th>
+                          <th className="w-[80px] px-4 py-2.5 text-right text-xs font-medium text-zinc-500">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-zinc-100 bg-white">
+                        {serviceTools.map((tool) => {
+                          const isOn = toolEnabled[tool.name] ?? tool.enabled;
+                          return (
+                            <tr key={tool.name} className="hover:bg-zinc-50 transition-colors">
+                              <td className="px-4 py-3 truncate">
+                                <span className="text-xs font-mono text-zinc-800">{tool.name}</span>
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className="text-xs text-zinc-500 line-clamp-2 leading-relaxed">
+                                  {tool.description_cn || tool.description}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3">
+                                <Toggle on={isOn} onToggle={() => handleToggleTool(tool.name, !isOn)} />
+                              </td>
+                              <td className="px-4 py-3 text-right">
+                                <button
+                                  onClick={() => setToolModal(tool)}
+                                  className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                                >
+                                  测试 / 详情
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── 概览 tab ── */}
+            {tab === 'overview' && (
+              <div className="px-5 py-4 space-y-3">
+                <div className="rounded-xl border border-zinc-100 divide-y divide-zinc-100 overflow-hidden">
+                  {[
+                    { label: '服务名称', value: metadata?.name || serviceId },
+                    metadata?.version ? { label: '版本', value: metadata.version } : null,
+                    { label: '工具数量', value: String(serviceTools.length) },
+                    vendor ? { label: '厂商', value: vendor.nameCn } : null,
+                    device?.storage_key ? { label: 'Storage Key', value: device.storage_key } : null,
+                    device?.service_id ? { label: 'Service ID', value: device.service_id } : null,
+                  ].filter(Boolean).map((row) => (
+                    <div key={row!.label} className="flex justify-between items-center px-4 py-2.5 gap-4">
+                      <span className="text-sm text-zinc-500 shrink-0">{row!.label}</span>
+                      <span className="text-sm text-zinc-900 truncate text-right">{row!.value}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {(metadata?.description_cn || metadata?.description) && (
+                  <div className="rounded-xl border border-zinc-100 px-4 py-3">
+                    <p className="text-xs font-semibold text-zinc-400 mb-1.5 uppercase tracking-wide">服务简介</p>
+                    <p className="text-sm text-zinc-600 leading-relaxed whitespace-pre-wrap">
+                      {metadata?.description_cn || metadata?.description}
+                    </p>
+                  </div>
+                )}
+
+                {metadata?.docs_url && (
+                  <a
+                    href={metadata.docs_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-2 text-sm text-blue-600 hover:text-blue-800 px-1"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                    查看 API 文档
+                  </a>
+                )}
+              </div>
+            )}
           </div>
         </div>
-
-        {/* Test result */}
-        {testResult && (
-          <div className={`rounded-lg px-4 py-3 text-sm flex items-start gap-2 ${
-            testResult.success ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-600'
-          }`}>
-            {testResult.success ? <CheckCircle className="w-4 h-4 flex-shrink-0 mt-0.5" /> : <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />}
-            <span>{testResult.message}</span>
-          </div>
-        )}
       </div>
 
-      {/* Footer */}
-      <div className="flex-shrink-0 px-5 py-4 border-t border-zinc-100 space-y-2">
-        <div className="flex gap-2">
-          {device && onTest && (
-            <button
-              onClick={handleTest}
-              disabled={testing}
-              className="flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg border border-zinc-200 text-zinc-600 hover:bg-zinc-50 disabled:opacity-50 transition-colors flex-1"
-            >
-              {testing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
-              测试连通
-            </button>
-          )}
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors flex-1"
-          >
-            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-            {device ? '保存配置' : '确认接入'}
-          </button>
-        </div>
-        {device && onDelete && (
-          <button
-            onClick={handleDelete}
-            disabled={deleting}
-            className="w-full flex items-center justify-center gap-1.5 py-2 text-sm rounded-lg border border-red-200 text-red-500 hover:bg-red-50 disabled:opacity-50 transition-colors"
-          >
-            {deleting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
-            {confirmDelete ? '确认删除此设备配置？' : '删除设备'}
-          </button>
-        )}
-      </div>
-    </div>
+      {/* ToolDetailModal overlay */}
+      {toolModal && (
+        <ToolDetailModal
+          tool={toolModal}
+          initialSection="test"
+          onClose={() => setToolModal(null)}
+        />
+      )}
+    </>
   );
 }
 
@@ -628,8 +791,8 @@ export default function DeviceIntegrationPage() {
         <div className="flex-1 flex items-center justify-center"><LoadingSpinner /></div>
       ) : (
         <div className="flex-1 flex overflow-hidden">
-          {/* Left: device list */}
-          <div className={`flex flex-col overflow-hidden transition-all duration-300 ${showPanel ? 'w-[calc(100%-480px)]' : 'w-full'}`}>
+          {/* Device list always takes full width; panel floats on top */}
+          <div className="flex flex-col overflow-hidden w-full">
             <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
 
               {/* ── 已接入设备 ── */}
@@ -696,19 +859,17 @@ export default function DeviceIntegrationPage() {
             </div>
           </div>
 
-          {/* Right: config panel */}
+          {/* Config panel rendered as fixed drawer overlay */}
           {showPanel && (
-            <div className="w-[480px] flex-shrink-0 border-l border-zinc-200 overflow-hidden">
-              <DeviceConfigPanel
-                key={panel.kind === 'edit' ? panel.device.id : panel.template.id}
-                device={panel.kind === 'edit' ? panel.device : undefined}
-                template={panel.kind === 'add' ? panel.template : undefined}
-                onSave={handleSave}
-                onDelete={panel.kind === 'edit' ? handleDelete : undefined}
-                onClose={() => setPanel(null)}
-                onTest={panel.kind === 'edit' ? handleTest : undefined}
-              />
-            </div>
+            <DeviceConfigPanel
+              key={panel.kind === 'edit' ? panel.device.id : panel.template.id}
+              device={panel.kind === 'edit' ? panel.device : undefined}
+              template={panel.kind === 'add' ? panel.template : undefined}
+              onSave={handleSave}
+              onDelete={panel.kind === 'edit' ? handleDelete : undefined}
+              onClose={() => setPanel(null)}
+              onTest={panel.kind === 'edit' ? handleTest : undefined}
+            />
           )}
         </div>
       )}
