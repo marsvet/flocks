@@ -27,6 +27,7 @@ const PermissionPage = lazy(() => import('@/pages/Permission'));
 const MonitoringPage = lazy(() => import('@/pages/Monitoring'));
 const WorkspacePage = lazy(() => import('@/pages/Workspace'));
 const DeviceIntegrationPage = lazy(() => import('@/pages/DeviceIntegration'));
+const SystemLogPage = lazy(() => import('@/pages/SystemLog'));
 
 function LazyRoute({ children }: { children: React.ReactNode }) {
   return (
@@ -114,9 +115,10 @@ export function Routes() {
         {/* MCP 已整合到工具清单页面 */}
         <Route path="mcp" element={<Navigate to="/tools" replace />} />
         
-        {/* 账号管理 */}
+        {/* 系统中心 */}
         <Route path="config" element={<LazyRoute><ConfigPage /></LazyRoute>} />
         <Route path="config/*" element={<Navigate to="/config" replace />} />
+        <Route path="system-logs" element={<LazyRoute><SystemLogPage /></LazyRoute>} />
         <Route path="channels" element={<LazyRoute><ChannelPage /></LazyRoute>} />
         <Route path="permissions" element={<LazyRoute><PermissionPage /></LazyRoute>} />
         <Route path="monitoring" element={<LazyRoute><MonitoringPage /></LazyRoute>} />

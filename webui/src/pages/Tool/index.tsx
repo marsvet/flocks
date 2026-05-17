@@ -57,7 +57,6 @@ import LocalTabContent from './components/LocalTabContent';
 import { getToolTabCounts } from './tabCounts';
 import { getCatalogDescription, getMetadataDescription } from '@/utils/mcpCatalog';
 import { getLocalizedToolDescription, getLocalizedFixtureLabel } from './toolDisplay';
-import LogViewerModal from '@/components/common/LogViewerModal';
 
 // ============================================================================
 // Constants & Config
@@ -165,7 +164,6 @@ export default function ToolPage() {
   const [mcpRefreshKey, setMcpRefreshKey] = useState(0);
   const [showAPISheet, setShowAPISheet] = useState(false);
   const [showGenerateSheet, setShowGenerateSheet] = useState(false);
-  const [showLogViewer, setShowLogViewer] = useState(false);
   // Sort: default by 类别 (source) MCP -> API -> 内置
   const [sort, setSort] = useState<SortState>({ field: 'source', dir: 'asc' });
   const [filters, setFilters] = useState<ColumnFilters>(EMPTY_FILTERS);
@@ -449,13 +447,6 @@ export default function ToolPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setShowLogViewer(true)}
-            className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 transition-colors"
-            title={t('logs.viewLogs')}
-          >
-            <FileText className="w-4 h-4" />
-          </button>
-          <button
             onClick={handleRefresh}
             disabled={refreshing}
             title={refreshDone ? t('button.refreshDone') : t('button.refreshList')}
@@ -674,7 +665,6 @@ export default function ToolPage() {
         />
       )}
 
-      <LogViewerModal open={showLogViewer} onClose={() => setShowLogViewer(false)} />
 
     </div>
   );

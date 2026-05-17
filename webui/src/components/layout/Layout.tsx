@@ -19,6 +19,7 @@ import {
   UserCog,
   Archive,
   ServerCog,
+  ScrollText,
 } from 'lucide-react';
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -310,9 +311,10 @@ export default function Layout() {
       ],
     },
     {
-      name: t('management'),
+      name: t('systemCenter'),
       items: [
         { name: t('accountManagement'), href: '/config', icon: UserCog },
+        { name: t('systemLog'), href: '/system-logs', icon: ScrollText },
       ],
     },
   ];
