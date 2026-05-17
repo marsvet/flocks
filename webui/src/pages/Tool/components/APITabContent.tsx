@@ -68,7 +68,8 @@ export default function APITabContent({
     try {
       setServicesLoading(true);
       const res = await providerAPI.listApiServices();
-      setServices(res.data || []);
+      // Exclude security device APIs — they live on the Device Integration page
+      setServices((res.data || []).filter((s) => s.integration_type !== 'device'));
     } catch {
       setServices([]);
     } finally {

@@ -18,6 +18,7 @@ import {
   ArrowUpCircle,
   UserCog,
   Archive,
+  ServerCog,
 } from 'lucide-react';
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -302,6 +303,7 @@ export default function Layout() {
         { name: t('agents'), href: '/agents', icon: Bot },
         { name: t('skills'), href: '/skills', icon: BookOpen },
         { name: t('tools'), href: '/tools', icon: Wrench },
+        { name: t('deviceIntegration'), href: '/devices', icon: ServerCog },
         { name: t('hub'), href: '/hub', icon: Archive },
         { name: t('models'), href: '/models', icon: Brain },
         { name: t('channels'), href: '/channels', icon: Radio },
