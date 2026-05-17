@@ -293,6 +293,59 @@ def _persist_fields(
     return out
 
 
+async def _sync_service_tool_state(service_id: str) -> None:
+    """Synchronise the api_services enabled flag in flocks.json based on DB.
+
+    Rule:
+      * ≥1 enabled device for *service_id* → set api_services[storage_key].enabled = True
+      * 0  enabled devices                → set api_services[storage_key].enabled = False
+
+    After updating flocks.json this re-runs ``ToolRegistry._sync_api_service_states()``
+    so that the LLM tool-list is immediately updated without a server restart.
+    """
+    try:
+        from flocks.config.config_writer import ConfigWriter
+        from flocks.tool.registry import ToolRegistry
+
+        async with Storage.connect(Storage.get_db_path()) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM device_integrations WHERE service_id=? AND enabled=1",
+                (service_id,),
+            )
+            row = await cur.fetchone()
+            enabled_count = int(row[0]) if row else 0
+
+            cur2 = await db.execute(
+                "SELECT DISTINCT storage_key FROM device_integrations WHERE service_id=?",
+                (service_id,),
+            )
+            storage_keys = [r[0] for r in await cur2.fetchall()]
+
+        should_enable = enabled_count > 0
+        for sk in storage_keys:
+            existing = ConfigWriter.get_api_service_raw(sk)
+            if isinstance(existing, dict):
+                existing["enabled"] = should_enable
+                ConfigWriter.set_api_service(sk, existing)
+            else:
+                # Create a minimal entry so the flag is persisted
+                ConfigWriter.set_api_service(sk, {"enabled": should_enable})
+
+        ToolRegistry._sync_api_service_states()
+
+        log.info("device.sync_tool_state", {
+            "service_id": service_id,
+            "enabled_devices": enabled_count,
+            "tools_enabled": should_enable,
+            "storage_keys": storage_keys,
+        })
+    except Exception as exc:
+        log.warn("device.sync_tool_state.failed", {
+            "service_id": service_id,
+            "error": str(exc),
+        })
+
+
 def _delete_associated_secrets(device_id: str, db_fields: Dict[str, str]) -> None:
     """Remove every ``.secret.json`` entry referenced by this device's
     ``{secret:device_<id>_<field>}`` placeholders.  Idempotent.
@@ -638,7 +691,9 @@ async def create_device(body: DeviceIntegrationCreate):
             ),
         )
         await db.commit()
-    return await get_device(device_id)
+    result = await get_device(device_id)
+    await _sync_service_tool_state(service_id)
+    return result
 
 
 @router.put("/{device_id}", response_model=DeviceIntegration)
@@ -682,7 +737,10 @@ async def update_device(device_id: str, body: DeviceIntegrationUpdate):
              json.dumps(new_fields), now, device_id),
         )
         await db.commit()
-    return await get_device(device_id)
+    result = await get_device(device_id)
+    # Re-sync tool visibility whenever device config changes (enabled flag may have changed)
+    await _sync_service_tool_state(row["service_id"])
+    return result
 
 
 @router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -690,11 +748,14 @@ async def delete_device(device_id: str):
     row = await _fetch_device_raw(device_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
+    service_id = row["service_id"]
     db_fields: Dict[str, str] = json.loads(row["fields"] or "{}")
     _delete_associated_secrets(device_id, db_fields)
     async with Storage.connect(Storage.get_db_path()) as db:
         await db.execute("DELETE FROM device_integrations WHERE id = ?", (device_id,))
         await db.commit()
+    # After deletion, recalculate whether any enabled device remains for this service
+    await _sync_service_tool_state(service_id)
 
 
 @router.post("/{device_id}/test", response_model=DeviceTestResult)
@@ -908,6 +969,20 @@ async def device_startup() -> None:
 
     1. Ensure the default group exists (FK target for device rows).
     2. Migrate legacy ``flocks.json`` entries into the SQL table.
+    3. Sync tool visibility for all registered service_ids so that disabled
+       devices hide their tools from the LLM without requiring a manual toggle.
     """
     await ensure_default_group()
     await migrate_device_integrations_from_config()
+
+    # Full sync: collect all distinct service_ids in DB and re-apply enabled state
+    try:
+        async with Storage.connect(Storage.get_db_path()) as db:
+            cur = await db.execute("SELECT DISTINCT service_id FROM device_integrations")
+            service_ids = [r[0] for r in await cur.fetchall()]
+        for sid in service_ids:
+            await _sync_service_tool_state(sid)
+        if service_ids:
+            log.info("device.startup.tool_sync", {"service_ids": service_ids})
+    except Exception as exc:
+        log.warn("device.startup.tool_sync.failed", {"error": str(exc)})
