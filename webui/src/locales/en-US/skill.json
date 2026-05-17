@@ -22,13 +22,42 @@
     "custom": "Custom Skills",
     "builtin": "Built-in Skills"
   },
+  "table": {
+    "type": "Type",
+    "name": "Name",
+    "source": "Source",
+    "status": "Status",
+    "enabled": "Enabled",
+    "actions": "Actions",
+    "edit": "Edit",
+    "builtin": "Built-in",
+    "custom": "Custom",
+    "totalCount_one": "{{count}} skill",
+    "totalCount_other": "{{count}} skills"
+  },
+  "pagination": {
+    "info": "Showing {{start}}–{{end}} of {{total}}"
+  },
+  "toggle": {
+    "enabledTip": "Enabled — click to remove from agent system prompt",
+    "disabledTip": "Disabled — click to add to agent system prompt",
+    "failed": "Toggle failed"
+  },
   "eligibility": {
     "ready": "Ready",
     "missingDeps": "Missing deps",
+    "missingDepsInline": "Missing: {{list}}",
     "installDeps": "Install deps",
     "installing": "Installing...",
     "installSuccess": "Dependencies installed",
     "installFailed": "Dependency install failed"
+  },
+  "filter": {
+    "aria": "Skill status filter",
+    "all": "All",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "showAll": "Show all"
   },
   "installDialog": {
     "title": "Install Skill",

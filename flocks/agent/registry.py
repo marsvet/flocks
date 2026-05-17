@@ -186,7 +186,9 @@ class Agent:
         # ── ① Collect context ─────────────────────────────────────────────
         available_tools = [t.name for t in ToolRegistry.list_tools() if t.enabled]
         categorized_tools = categorize_tools(available_tools)
-        skills = await Skill.all()
+        # Use list_enabled() so user-disabled skills are excluded from the
+        # agent's system prompt context.  All() would include them.
+        skills = await Skill.list_enabled()
         available_skills = [
             AvailableSkill(name=s.name, description=s.description, location=s.source or "project")
             for s in skills

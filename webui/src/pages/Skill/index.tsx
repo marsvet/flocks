@@ -1,5 +1,18 @@
 import { useState, useEffect, useMemo } from 'react';
-import { BookOpen, Search, Plus, RefreshCw, Sparkles, FolderOpen, CloudDownload, CheckCircle, AlertTriangle, Loader2, Trash2 } from 'lucide-react';
+import {
+  BookOpen,
+  Search,
+  Plus,
+  RefreshCw,
+  Sparkles,
+  FolderOpen,
+  CloudDownload,
+  AlertTriangle,
+  Loader2,
+  Pencil,
+  ChevronLeft,
+  ChevronRight,
+} from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import PageHeader from '@/components/common/PageHeader';
 import LoadingSpinner from '@/components/common/LoadingSpinner';
@@ -8,6 +21,8 @@ import { useToast } from '@/components/common/Toast';
 import { skillAPI, Skill } from '@/api/skill';
 import SkillSheet from './SkillSheet';
 import SkillInstallDialog from './SkillInstallDialog';
+
+const PAGE_SIZE = 25;
 
 export default function SkillPage() {
   const { t } = useTranslation('skill');
@@ -18,10 +33,16 @@ export default function SkillPage() {
   const [installingDeps, setInstallingDeps] = useState<Record<string, boolean>>({});
   const toast = useToast();
 
-  // Sheet state
   const [sheetSkill, setSheetSkill] = useState<Skill | null>(null);
   const [showCreateSheet, setShowCreateSheet] = useState(false);
   const [showInstallDialog, setShowInstallDialog] = useState(false);
+  const [page, setPage] = useState(1);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshDone, setRefreshDone] = useState(false);
+  const [togglingSkills, setTogglingSkills] = useState<Record<string, boolean>>({});
+  // Status filter combines "stat counter" and "view filter" into one chip
+  // group.  Clicking a chip both shows its number and applies the filter.
+  const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all');
 
   const fetchSkills = async (
     { silent = false, invalidateOnError = false }: { silent?: boolean; invalidateOnError?: boolean } = {}
@@ -31,13 +52,11 @@ export default function SkillPage() {
         setLoading(true);
         setError(null);
       }
-      // Use /status endpoint to get eligibility info
       const response = await skillAPI.status();
       setSkills(Array.isArray(response.data) ? response.data : []);
       setError(null);
       return true;
     } catch {
-      // Fallback to plain list if status endpoint isn't available yet
       try {
         const fallback = await skillAPI.list();
         setSkills(Array.isArray(fallback.data) ? fallback.data : []);
@@ -65,27 +84,58 @@ export default function SkillPage() {
     fetchSkills();
   }, []);
 
-  const filteredSkills = useMemo(
-    () => skills.filter(skill =>
-      skill.category !== 'system' && (
-        skill.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (skill.description || '').toLowerCase().includes(searchQuery.toLowerCase())
-      )
-    ),
-    [skills, searchQuery],
+  // Skills visible to this page: everything except the internal "system"
+  // category.  Counter chips operate on this set so the totals reflect
+  // what the user can actually see — search and statusFilter both narrow
+  // it further into ``filteredSkills``.
+  const visibleSkills = useMemo(
+    () => skills.filter(s => s.category !== 'system'),
+    [skills],
   );
 
-  const [refreshing, setRefreshing] = useState(false);
-  const [refreshDone, setRefreshDone] = useState(false);
+  const enabledCount = useMemo(
+    () => visibleSkills.filter(s => !s.disabled).length,
+    [visibleSkills],
+  );
+  const disabledCount = visibleSkills.length - enabledCount;
 
-  const userSkills = useMemo(() => filteredSkills.filter(isUserManaged), [filteredSkills]);
-  const builtinSkills = useMemo(() => filteredSkills.filter(s => !isUserManaged(s)), [filteredSkills]);
+  const filteredSkills = useMemo(() => {
+    const q = searchQuery.toLowerCase();
+    return visibleSkills.filter(skill => {
+      if (statusFilter === 'enabled' && skill.disabled) return false;
+      if (statusFilter === 'disabled' && !skill.disabled) return false;
+      if (!q) return true;
+      return (
+        skill.name.toLowerCase().includes(q) ||
+        (skill.description || '').toLowerCase().includes(q)
+      );
+    });
+  }, [visibleSkills, searchQuery, statusFilter]);
+
+  // Reset to first page whenever search or status filter changes
+  useEffect(() => { setPage(1); }, [searchQuery, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredSkills.length / PAGE_SIZE));
+
+  // Keep `page` state in sync with the list size.  Without this, deleting
+  // enough items to shrink `totalPages` below the current `page` only
+  // clamps the *view* via `currentPage` below — the underlying state stays
+  // stale, so adding new skills later causes a confusing "jump" back to
+  // the old page.  We mirror the clamp into state here.
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [totalPages, page]);
+
+  const currentPage = Math.min(page, totalPages);
+  const pagedSkills = useMemo(
+    () => filteredSkills.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE),
+    [filteredSkills, currentPage],
+  );
 
   const handleRefresh = async () => {
     if (refreshing) return;
     try {
       setRefreshing(true);
-      // Ensure a minimum spin duration so the animation is clearly visible
       await Promise.all([
         skillAPI.refresh().then(() => fetchSkills({ silent: true })),
         new Promise((r) => setTimeout(r, 600)),
@@ -117,6 +167,23 @@ export default function SkillPage() {
     }
   };
 
+  const handleToggle = async (skill: Skill, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setTogglingSkills(prev => ({ ...prev, [skill.name]: true }));
+    try {
+      const res = await skillAPI.toggle(skill.name);
+      // Update local state after the server confirms — keeps UI in sync
+      // without an extra GET round-trip.
+      setSkills(prev => prev.map(s =>
+        s.name === skill.name ? { ...s, disabled: res.data.disabled } : s
+      ));
+    } catch (err: unknown) {
+      toast.error(t('toggle.failed'), err instanceof Error ? err.message : String(err));
+    } finally {
+      setTogglingSkills(prev => ({ ...prev, [skill.name]: false }));
+    }
+  };
+
   const handleInstallDeps = async (skill: Skill, e: React.MouseEvent) => {
     e.stopPropagation();
     setInstallingDeps(prev => ({ ...prev, [skill.name]: true }));
@@ -142,18 +209,6 @@ export default function SkillPage() {
 
   const handleInstalled = async () => {
     await refreshSkillsAndFetch();
-  };
-
-  const handleDeleteFromCard = async (skill: Skill, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (skill.source === 'project') return;
-    if (!confirm(t('sheet.deleteConfirm', { name: skill.name }))) return;
-    try {
-      await skillAPI.delete(skill.name);
-      await fetchSkills({ silent: true, invalidateOnError: true });
-    } catch (err: unknown) {
-      toast.error(t('sheet.deleteFailed'), err instanceof Error ? err.message : String(err));
-    }
   };
 
   if (loading) {
@@ -183,133 +238,134 @@ export default function SkillPage() {
         title={t('pageTitle')}
         description={t('pageDescription')}
         icon={<BookOpen className="w-8 h-8" />}
-        action={
-          <div className="flex items-center gap-2">
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
-              <input
-                type="text"
-                placeholder={t('searchPlaceholder')}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-48 pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-400 text-sm"
-              />
-            </div>
-            <button
-              onClick={handleRefresh}
-              disabled={refreshing}
-              title={refreshDone ? t('refreshed') : t('refresh')}
-              className={`p-2 border rounded-lg transition-all ${
-                refreshDone
-                  ? 'border-green-300 text-green-600 bg-green-50'
-                  : 'border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-50'
-              }`}
-            >
-              <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
-            <button
-              onClick={() => setShowInstallDialog(true)}
-              className="flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 bg-white rounded-lg hover:bg-gray-50 transition-colors"
-            >
-              <CloudDownload className="w-4 h-4" />
-              {t('installSkill')}
-            </button>
-            <button
-              onClick={() => setShowCreateSheet(true)}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              {t('createSkill')}
-            </button>
-          </div>
-        }
       />
 
-      <div className="flex-1 overflow-y-auto px-2 py-2">
-        {filteredSkills.length === 0 ? (
-          <EmptyState
-            icon={<BookOpen className="w-16 h-16" />}
-            title={searchQuery ? t('emptyState.noResults') : t('emptyState.noSkills')}
-            description={searchQuery ? t('emptyState.tryOtherKeywords') : t('emptyState.createFirst')}
-            action={
-              !searchQuery ? (
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setShowInstallDialog(true)}
-                    className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 bg-white rounded-lg hover:bg-gray-50"
-                  >
-                    <CloudDownload className="w-5 h-5" />
-                    {t('installSkill')}
-                  </button>
-                  <button
-                    onClick={() => setShowCreateSheet(true)}
-                    className="inline-flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
-                  >
-                    <Plus className="w-5 h-5" />
-                    {t('createSkill')}
-                  </button>
-                </div>
-              ) : undefined
-            }
+      {/* Toolbar: 搜索 · 统计过滤 chips · 刷新/安装/创建 */}
+      <div className="px-4 py-2 border-b border-gray-100 flex flex-wrap items-center gap-3">
+        {/* 搜索 */}
+        <div className="relative w-64">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+          <input
+            type="text"
+            placeholder={t('searchPlaceholder')}
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-9 pr-3 py-1.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-slate-300 focus:border-slate-400 text-sm bg-white"
           />
-        ) : (
-          <>
-            {/* 用户自定义技能（source: user | flocks | claude | 其他） */}
-            {userSkills.length > 0 && (
-              <div className="mb-5">
-                <div className="flex items-center gap-2 mb-2.5 px-1">
-                  <FolderOpen className="w-4 h-4 text-slate-500" />
-                  <span className="text-sm font-semibold text-slate-700">{t('section.custom')}</span>
-                  <span className="text-xs text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded-full">
-                    {userSkills.length}
-                  </span>
-                </div>
-                <div className="grid gap-3 grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                  {userSkills.map(skill => (
-                    <SkillCard
-                      key={skill.name}
-                      skill={skill}
-                      isSelected={sheetSkill?.name === skill.name}
-                      installingDeps={installingDeps[skill.name] ?? false}
-                      onClick={() => handleSelectSkill(skill)}
-                      onInstallDeps={(e) => handleInstallDeps(skill, e)}
-                      onDelete={(e) => handleDeleteFromCard(skill, e)}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
+        </div>
 
-            {/* 内置技能（source: project，即项目 .flocks/plugins 目录） */}
-            {builtinSkills.length > 0 && (
-              <div>
-                <div className="flex items-center gap-2 mb-2.5 px-1">
-                  <Sparkles className="w-4 h-4 text-purple-500" />
-                  <span className="text-sm font-semibold text-purple-700">{t('section.builtin')}</span>
-                  <span className="text-xs text-purple-400 bg-purple-50 px-1.5 py-0.5 rounded-full">
-                    {builtinSkills.length}
-                  </span>
-                </div>
-                <div className="grid gap-3 grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                  {builtinSkills.map(skill => (
-                    <SkillCard
-                      key={skill.name}
-                      skill={skill}
-                      isSelected={sheetSkill?.name === skill.name}
-                      installingDeps={installingDeps[skill.name] ?? false}
-                      onClick={() => handleSelectSkill(skill)}
-                      onInstallDeps={(e) => handleInstallDeps(skill, e)}
-                      onDelete={(e) => handleDeleteFromCard(skill, e)}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-          </>
+        {/* 统计 + 过滤 segment chips */}
+        <FilterChips
+          value={statusFilter}
+          onChange={setStatusFilter}
+          total={visibleSkills.length}
+          enabled={enabledCount}
+          disabled={disabledCount}
+        />
+
+        {/* 右侧操作：刷新 + 安装 + 创建 */}
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing}
+            title={refreshDone ? t('refreshed') : t('refresh')}
+            className={`p-1.5 rounded-lg border transition-all ${
+              refreshDone
+                ? 'border-green-200 text-green-600'
+                : 'border-gray-200 text-gray-400 hover:bg-gray-50 hover:text-gray-600 disabled:opacity-50'
+            }`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          </button>
+          <button
+            onClick={() => setShowInstallDialog(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-gray-300 text-gray-700 bg-white rounded-lg hover:bg-gray-50 transition-colors text-sm"
+          >
+            <CloudDownload className="w-4 h-4" />
+            {t('installSkill')}
+          </button>
+          <button
+            onClick={() => setShowCreateSheet(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors text-sm"
+          >
+            <Plus className="w-4 h-4" />
+            {t('createSkill')}
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-4 py-3">
+        {filteredSkills.length === 0 ? (
+          (() => {
+            // Three distinct empty states:
+            //   * narrowed by search       — show "no results"
+            //   * narrowed by status chip  — show "no skills in this view"
+            //                                with a quick "show all" reset
+            //   * truly empty inventory    — show CTA buttons
+            const isNarrowed = !!searchQuery || statusFilter !== 'all';
+            return (
+              <EmptyState
+                icon={<BookOpen className="w-16 h-16" />}
+                title={isNarrowed ? t('emptyState.noResults') : t('emptyState.noSkills')}
+                description={
+                  isNarrowed
+                    ? t('emptyState.tryOtherKeywords')
+                    : t('emptyState.createFirst')
+                }
+                action={
+                  isNarrowed ? (
+                    statusFilter !== 'all' ? (
+                      <button
+                        onClick={() => setStatusFilter('all')}
+                        className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 bg-white rounded-lg hover:bg-gray-50"
+                      >
+                        {t('filter.showAll')}
+                      </button>
+                    ) : undefined
+                  ) : (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setShowInstallDialog(true)}
+                        className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 text-gray-700 bg-white rounded-lg hover:bg-gray-50"
+                      >
+                        <CloudDownload className="w-5 h-5" />
+                        {t('installSkill')}
+                      </button>
+                      <button
+                        onClick={() => setShowCreateSheet(true)}
+                        className="inline-flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700"
+                      >
+                        <Plus className="w-5 h-5" />
+                        {t('createSkill')}
+                      </button>
+                    </div>
+                  )
+                }
+              />
+            );
+          })()
+        ) : (
+          <SkillTable
+            skills={pagedSkills}
+            selectedSkill={sheetSkill}
+            installingDeps={installingDeps}
+            togglingSkills={togglingSkills}
+            onSelect={handleSelectSkill}
+            onInstallDeps={handleInstallDeps}
+            onToggle={handleToggle}
+          />
         )}
       </div>
 
-      {/* Detail / Edit Sheet */}
+      {filteredSkills.length > PAGE_SIZE && (
+        <PaginationBar
+          total={filteredSkills.length}
+          page={currentPage}
+          totalPages={totalPages}
+          onPageChange={setPage}
+        />
+      )}
+
       {sheetSkill && (
         <SkillSheet
           skill={sheetSkill}
@@ -325,7 +381,6 @@ export default function SkillPage() {
         />
       )}
 
-      {/* Create Sheet */}
       {showCreateSheet && (
         <SkillSheet
           onClose={() => setShowCreateSheet(false)}
@@ -336,7 +391,6 @@ export default function SkillPage() {
         />
       )}
 
-      {/* Install Dialog */}
       {showInstallDialog && (
         <SkillInstallDialog
           onClose={() => setShowInstallDialog(false)}
@@ -349,137 +403,342 @@ export default function SkillPage() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Custom skills: everything except project-installed (.flocks/plugins) built-in skills. */
 function isUserManaged(skill: Skill): boolean {
   return skill.source !== 'project';
 }
 
-// ─── SkillCard ────────────────────────────────────────────────────────────────
+// ─── SkillTable ───────────────────────────────────────────────────────────────
 
-interface SkillCardProps {
+interface SkillTableProps {
+  skills: Skill[];
+  selectedSkill: Skill | null;
+  installingDeps: Record<string, boolean>;
+  togglingSkills: Record<string, boolean>;
+  onSelect: (skill: Skill) => void;
+  onInstallDeps: (skill: Skill, e: React.MouseEvent) => void;
+  onToggle: (skill: Skill, e: React.MouseEvent) => void;
+}
+
+function SkillTable({ skills, selectedSkill, installingDeps, togglingSkills, onSelect, onInstallDeps, onToggle }: SkillTableProps) {
+  const { t } = useTranslation('skill');
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+      <table className="min-w-full table-fixed text-xs">
+        {/* 5-column layout: type 8% · name+desc+deps 50% · source 18%
+            · enabled-toggle 12% · actions 12%.  We dropped the dedicated
+            "Status" column because it only ever showed Ready / Missing,
+            and "Missing" is more actionable inline beneath the name. */}
+        <colgroup>
+          <col style={{ width: '8%' }} />
+          <col style={{ width: '50%' }} />
+          <col style={{ width: '18%' }} />
+          <col style={{ width: '12%' }} />
+          <col style={{ width: '12%' }} />
+        </colgroup>
+        <thead className="bg-gray-50 text-gray-500 border-b border-gray-200">
+          <tr>
+            <th className="text-left px-4 py-2.5 font-medium">{t('table.type')}</th>
+            <th className="text-left px-4 py-2.5 font-medium">{t('table.name')}</th>
+            <th className="text-left px-4 py-2.5 font-medium">{t('table.source')}</th>
+            <th
+              className="text-left px-4 py-2.5 font-medium"
+              title={t('toggle.enabledTip')}
+            >
+              {t('table.enabled')}
+            </th>
+            <th className="text-right px-4 py-2.5 font-medium">{t('table.actions')}</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-100">
+          {skills.map(skill => (
+            <SkillRow
+              key={skill.name}
+              skill={skill}
+              isSelected={selectedSkill?.name === skill.name}
+              installingDeps={installingDeps[skill.name] ?? false}
+              toggling={togglingSkills[skill.name] ?? false}
+              onSelect={onSelect}
+              onInstallDeps={onInstallDeps}
+              onToggle={onToggle}
+            />
+          ))}
+          {skills.length === 0 && (
+            <tr>
+              <td colSpan={5} className="px-4 py-12 text-center text-gray-400">
+                {t('emptyState.noResults')}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── SkillRow ─────────────────────────────────────────────────────────────────
+
+interface SkillRowProps {
   skill: Skill;
   isSelected: boolean;
   installingDeps: boolean;
-  onClick: () => void;
-  onInstallDeps: (e: React.MouseEvent) => void;
-  onDelete?: (e: React.MouseEvent) => void;
+  toggling: boolean;
+  onSelect: (skill: Skill) => void;
+  onInstallDeps: (skill: Skill, e: React.MouseEvent) => void;
+  onToggle: (skill: Skill, e: React.MouseEvent) => void;
 }
 
-// 内置技能的颜色配置（按 source 区分，同 source 内按 name 散列分色）
-const BUILTIN_PALETTES = [
-  { bg: 'bg-purple-50', border: 'border-purple-200', icon: 'bg-purple-100 text-purple-600', ring: 'ring-purple-300', name: 'text-purple-900' },
-  { bg: 'bg-violet-50', border: 'border-violet-200', icon: 'bg-violet-100 text-violet-600', ring: 'ring-violet-300', name: 'text-violet-900' },
-  { bg: 'bg-sky-50', border: 'border-sky-200', icon: 'bg-sky-100 text-sky-600', ring: 'ring-sky-300', name: 'text-sky-900' },
-  { bg: 'bg-teal-50', border: 'border-teal-200', icon: 'bg-teal-100 text-teal-600', ring: 'ring-teal-300', name: 'text-teal-900' },
-  { bg: 'bg-emerald-50', border: 'border-emerald-200', icon: 'bg-emerald-100 text-emerald-600', ring: 'ring-emerald-300', name: 'text-emerald-900' },
-];
-
-const PROJECT_PALETTE = {
-  bg: 'bg-slate-50', border: 'border-slate-200', icon: 'bg-slate-100 text-slate-600', ring: 'ring-slate-300', name: 'text-slate-900',
-};
-
-function hashIndex(str: string, len: number) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
-  return h % len;
-}
-
-function SkillCard({ skill, isSelected, installingDeps, onClick, onInstallDeps, onDelete }: SkillCardProps) {
+function SkillRow({ skill, isSelected, installingDeps, toggling, onSelect, onInstallDeps, onToggle }: SkillRowProps) {
   const { t } = useTranslation('skill');
-  const isUserSkill = isUserManaged(skill) && skill.source !== 'project';
-  const palette = isUserManaged(skill)
-    ? PROJECT_PALETTE
-    : BUILTIN_PALETTES[hashIndex(skill.name, BUILTIN_PALETTES.length)];
-
+  const isUser = isUserManaged(skill);
   const hasMissingDeps = skill.eligible === false && (skill.install_specs?.length ?? 0) > 0;
+  const enabled = !skill.disabled;
 
+  // Row is no longer clickable — the edit button in the "Actions" column
+  // is the only way to open SkillSheet.  We keep a subtle hover so users
+  // can still scan rows visually, but drop ``cursor-pointer`` to avoid
+  // promising a click-affordance that isn't there.
+  return (
+    <tr
+      className={`transition-colors ${
+        skill.disabled ? 'opacity-50' : 'hover:bg-gray-50'
+      } ${isSelected ? 'bg-slate-50' : ''}`}
+    >
+      {/* 类型列 */}
+      <td className="px-4 py-3">
+        <SourceTypeBadge isUser={isUser} />
+      </td>
+
+      {/* 名称 + 描述列（含内嵌的缺依赖警告） */}
+      <td className="max-w-0 px-4 py-3">
+        <div className="flex items-start gap-2.5 min-w-0">
+          <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 bg-gray-100 text-gray-400 mt-0.5">
+            {isUser
+              ? <FolderOpen className="w-3.5 h-3.5" />
+              : <Sparkles className="w-3.5 h-3.5" />
+            }
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-gray-900 truncate">{skill.name}</div>
+            <div className="text-[11px] text-gray-400 truncate mt-0.5">
+              {skill.description || t('sheet.noDescription')}
+            </div>
+            {/* The old "Status" column collapsed to this single inline
+                warning — only rendered when the skill is actually
+                missing dependencies, so the row stays quiet by default. */}
+            {hasMissingDeps && (
+              <div
+                className="text-[11px] text-amber-600 truncate mt-0.5 flex items-center gap-1"
+                title={(skill.missing ?? []).join(', ')}
+              >
+                <AlertTriangle className="w-3 h-3 shrink-0" />
+                <span className="truncate">
+                  {t('eligibility.missingDepsInline', {
+                    list: (skill.missing ?? []).join(', '),
+                  })}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      </td>
+
+      {/* 来源列 */}
+      <td className="max-w-0 px-4 py-3">
+        <span className="text-[11px] text-gray-400 font-mono truncate block" title={skill.location}>
+          {skill.source ?? '-'}
+        </span>
+      </td>
+
+      {/* 启用开关列：控制 skill 是否注入 Agent System Prompt */}
+      <td className="px-4 py-3">
+        <ToggleSwitch
+          enabled={enabled}
+          loading={toggling}
+          title={enabled ? t('toggle.enabledTip') : t('toggle.disabledTip')}
+          onChange={(e) => onToggle(skill, e)}
+        />
+      </td>
+
+      {/* 操作列：编辑（+ 缺依赖时的安装按钮）；删除操作在编辑面板内 */}
+      <td className="px-4 py-3 text-right">
+        <div className="flex items-center justify-end gap-1">
+          {hasMissingDeps && (
+            <button
+              onClick={(e) => onInstallDeps(skill, e)}
+              disabled={installingDeps}
+              title={t('eligibility.installDeps')}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-gray-200
+                         bg-white text-gray-600 hover:bg-gray-50 transition-colors disabled:opacity-50"
+            >
+              {installingDeps
+                ? <Loader2 className="w-3 h-3 animate-spin" />
+                : <CloudDownload className="w-3 h-3" />
+              }
+              {installingDeps ? t('eligibility.installing') : t('eligibility.installDeps')}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onSelect(skill)}
+            title={t('table.edit')}
+            aria-label={t('table.edit')}
+            className="p-1.5 rounded-md border border-gray-200 text-gray-500
+                       hover:border-slate-300 hover:text-slate-700 hover:bg-gray-50
+                       transition-colors"
+          >
+            <Pencil className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function ToggleSwitch({ enabled, loading, title, onChange }: {
+  enabled: boolean;
+  loading: boolean;
+  title?: string;
+  onChange: (e: React.MouseEvent) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={enabled}
+      onClick={onChange}
+      disabled={loading}
+      title={title}
+      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border-2 border-transparent
+        transition-colors duration-150 focus:outline-none disabled:cursor-wait
+        ${enabled ? 'bg-slate-700' : 'bg-gray-200'}`}
+    >
+      {loading
+        ? <Loader2 className="absolute inset-0 m-auto w-3 h-3 text-white animate-spin" />
+        : (
+          <span className={`pointer-events-none inline-block h-4 w-4 rounded-full bg-white shadow
+            transform transition-transform duration-150
+            ${enabled ? 'translate-x-4' : 'translate-x-0'}`}
+          />
+        )
+      }
+    </button>
+  );
+}
+
+function SourceTypeBadge({ isUser }: { isUser: boolean }) {
+  const { t } = useTranslation('skill');
+  if (isUser) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-gray-200 bg-white text-gray-500 whitespace-nowrap">
+        <FolderOpen className="w-3 h-3" />
+        {t('table.custom')}
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-gray-200 bg-gray-50 text-gray-500 whitespace-nowrap">
+      <Sparkles className="w-3 h-3" />
+      {t('table.builtin')}
+    </span>
+  );
+}
+
+// ─── FilterChips ──────────────────────────────────────────────────────────────
+//
+// One segmented control that serves both as the "how many" stat readout and
+// as the view-filter.  Each chip shows `label · count` and is highlighted
+// when active.  Clicking a chip toggles the filter to that segment.
+
+type StatusFilterValue = 'all' | 'enabled' | 'disabled';
+
+function FilterChips({
+  value,
+  onChange,
+  total,
+  enabled,
+  disabled,
+}: {
+  value: StatusFilterValue;
+  onChange: (v: StatusFilterValue) => void;
+  total: number;
+  enabled: number;
+  disabled: number;
+}) {
+  const { t } = useTranslation('skill');
+  const chips: Array<{ key: StatusFilterValue; label: string; count: number }> = [
+    { key: 'all', label: t('filter.all'), count: total },
+    { key: 'enabled', label: t('filter.enabled'), count: enabled },
+    { key: 'disabled', label: t('filter.disabled'), count: disabled },
+  ];
   return (
     <div
-      onClick={onClick}
-      className={`
-        relative rounded-xl border overflow-hidden cursor-pointer
-        h-[180px] flex flex-col
-        transition-all duration-150
-        ${palette.bg} ${palette.border}
-        ${isSelected
-          ? `shadow-md ring-2 ${palette.ring}`
-          : 'shadow-sm hover:shadow-md hover:brightness-95'
-        }
-      `}
+      role="tablist"
+      aria-label={t('filter.aria')}
+      className="inline-flex items-center rounded-lg border border-gray-200 bg-white p-0.5 text-xs"
     >
-      {/* 删除图标（右上角） */}
-      <button
-        type="button"
-        onClick={onDelete}
-        disabled={!isUserSkill}
-        title={!isUserSkill ? t('sheet.deleteBuiltinTip') : t('sheet.delete')}
-        className={`absolute top-2 right-2 z-10 p-1 rounded-md transition-colors
-          ${isUserSkill
-            ? 'text-red-400 hover:text-red-600 hover:bg-red-50'
-            : 'text-gray-300 cursor-not-allowed'
-          }`}
-      >
-        <Trash2 className="w-3.5 h-3.5" />
-      </button>
-
-      {/* 顶部：图标 + 名称 */}
-      <div className="flex items-start gap-3 px-4 pt-4 pb-2 pr-8">
-        <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${palette.icon}`}>
-          {isUserManaged(skill)
-            ? <FolderOpen className="w-4 h-4" />
-            : <Sparkles className="w-4 h-4" />
-          }
-        </div>
-        <div className="min-w-0 flex-1">
-          <span className={`text-sm font-semibold leading-tight block truncate ${palette.name}`}>
-            {skill.name}
-          </span>
-          {skill.source && (
-            <span className="text-[10px] text-gray-400 font-mono">
-              {skill.source}
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* 描述 */}
-      <p className="flex-1 px-4 min-h-0 text-xs text-gray-600 leading-relaxed line-clamp-3">
-        {skill.description || t('common:empty.noDescription')}
-      </p>
-
-      {/* 底部：eligibility badge */}
-      <div className="px-4 pb-3 pt-1 flex items-center justify-between">
-        {skill.eligible === true && (
-          <span className="inline-flex items-center gap-1 text-[10px] text-green-600 font-medium">
-            <CheckCircle className="w-3 h-3" />
-            {t('eligibility.ready')}
-          </span>
-        )}
-        {skill.eligible === false && (
-          <span className="inline-flex items-center gap-1 text-[10px] text-amber-600 font-medium">
-            <AlertTriangle className="w-3 h-3" />
-            {t('eligibility.missingDeps')}
-          </span>
-        )}
-        {skill.eligible == null && <span />}
-
-        {/* Install deps button (shown only when there are missing deps with install specs) */}
-        {hasMissingDeps && (
+      {chips.map((chip, idx) => {
+        const active = chip.key === value;
+        return (
           <button
-            onClick={onInstallDeps}
-            disabled={installingDeps}
-            title={t('eligibility.installDeps')}
-            className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full
-                       bg-amber-100 text-amber-700 border border-amber-200
-                       hover:bg-amber-200 transition-colors disabled:opacity-50"
+            key={chip.key}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(chip.key)}
+            className={`px-2.5 py-1 rounded-md transition-colors whitespace-nowrap ${
+              active
+                ? 'bg-slate-700 text-white'
+                : 'text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+            } ${idx > 0 ? 'ml-0.5' : ''}`}
           >
-            {installingDeps
-              ? <Loader2 className="w-3 h-3 animate-spin" />
-              : <CloudDownload className="w-3 h-3" />
-            }
-            {installingDeps ? t('eligibility.installing') : t('eligibility.installDeps')}
+            <span>{chip.label}</span>
+            <span
+              className={`ml-1.5 inline-block min-w-[1.25rem] px-1 rounded text-[10px] tabular-nums ${
+                active ? 'bg-white/15' : 'bg-gray-100 text-gray-500'
+              }`}
+            >
+              {chip.count}
+            </span>
           </button>
-        )}
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── PaginationBar ────────────────────────────────────────────────────────────
+
+function PaginationBar({ total, page, totalPages, onPageChange }: {
+  total: number;
+  page: number;
+  totalPages: number;
+  onPageChange: (page: number) => void;
+}) {
+  const { t } = useTranslation('skill');
+  const start = (page - 1) * PAGE_SIZE + 1;
+  const end = Math.min(total, page * PAGE_SIZE);
+  return (
+    <div className="px-4 py-2 border-t border-gray-200 bg-white flex items-center justify-between text-xs text-gray-500">
+      <span>{t('pagination.info', { start, end, total })}</span>
+      <div className="flex items-center gap-1">
+        <button
+          onClick={() => onPageChange(Math.max(1, page - 1))}
+          disabled={page <= 1}
+          className="p-1 rounded border border-gray-200 hover:bg-gray-50 disabled:opacity-40"
+        >
+          <ChevronLeft className="w-3.5 h-3.5" />
+        </button>
+        <span className="min-w-16 text-center">{page} / {totalPages}</span>
+        <button
+          onClick={() => onPageChange(Math.min(totalPages, page + 1))}
+          disabled={page >= totalPages}
+          className="p-1 rounded border border-gray-200 hover:bg-gray-50 disabled:opacity-40"
+        >
+          <ChevronRight className="w-3.5 h-3.5" />
+        </button>
       </div>
     </div>
   );

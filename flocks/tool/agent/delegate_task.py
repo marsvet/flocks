@@ -156,7 +156,9 @@ async def _resolve_skill_content(skill_names: List[str]) -> Dict[str, Any]:
         except Exception as exc:
             return {"content": None, "error": f"Failed to load skill {name}: {exc}"}
     if missing:
-        all_skills = await Skill.all()
+        # Only surface enabled skills to the LLM — listing disabled ones in
+        # an error message would invite the model to retry with them.
+        all_skills = await Skill.list_enabled()
         available = ", ".join(s.name for s in all_skills) or "none"
         return {"content": None, "error": f"Skills not found: {', '.join(missing)}. Available: {available}"}
     return {"content": "\n\n".join(resolved), "error": None}

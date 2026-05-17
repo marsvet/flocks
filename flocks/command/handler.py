@@ -161,19 +161,26 @@ async def handle_slash_command(
         return True
 
     if name == "skills":
+        # User-facing /skills lists ALL skills (Skill.all) and annotates
+        # disabled ones so users can tell at a glance which skills will
+        # not be surfaced to the agent.
         if not args or args == "list":
             skills = await Skill.all()
+            disabled = Skill.load_disabled()
             lines = ["Available skills:", ""]
             for i, skill in enumerate(skills, 1):
-                lines.append(f"{i}. {skill.name}: {skill.description}")
+                suffix = " [disabled]" if skill.name in disabled else ""
+                lines.append(f"{i}. {skill.name}{suffix}: {skill.description}")
             await send_text("\n".join(lines))
             return True
 
         if args == "refresh":
             skills = await Skill.refresh()
+            disabled = Skill.load_disabled()
             lines = ["Skills refreshed. Current list:", ""]
             for i, skill in enumerate(skills, 1):
-                lines.append(f"{i}. {skill.name}: {skill.description}")
+                suffix = " [disabled]" if skill.name in disabled else ""
+                lines.append(f"{i}. {skill.name}{suffix}: {skill.description}")
             await send_text("\n".join(lines))
             return True
 

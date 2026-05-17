@@ -134,7 +134,9 @@ async def run_slash_command_tool(ctx: ToolContext, command: str) -> ToolResult:
 
     if command == "skills":
         from flocks.skill.skill import Skill
-        skills = await Skill.all()
+        # /skills is a slash command that the LLM may invoke; report only
+        # enabled skills so disabled ones do not leak back into context.
+        skills = await Skill.list_enabled()
         if not skills:
             return ToolResult(success=True, output="No skills available.")
         lines = ["Available Skills:", ""]
