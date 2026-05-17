@@ -30,12 +30,10 @@ log = Log.create(service="tool.device.migration")
 
 async def migrate_from_config() -> None:
     """Migrate legacy device API configurations from ``flocks.json`` to SQL."""
-    # TODO(arch): Reverse dependency on flocks.server.routes.provider helpers.
-    # See note in flocks/tool/device/secrets.py — same root cause.
     try:
         from flocks.config.config_writer import ConfigWriter
         from flocks.security import get_secret_manager
-        from flocks.server.routes.provider import (
+        from flocks.tool.api_service.schema import (
             _build_api_service_credential_schema,
             _get_api_service_secret_candidates,
             _load_api_service_metadata_data,
