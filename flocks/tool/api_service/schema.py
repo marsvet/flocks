@@ -14,8 +14,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
 from pydantic import BaseModel
 
+from flocks.config.api_versioning import discover_api_service_descriptors
 from flocks.config.config_writer import ConfigWriter
 from flocks.tool.tool_loader import extract_provider_version
 from flocks.utils.log import Log
@@ -84,7 +86,8 @@ def _should_persist_secondary_secret(metadata: Optional[Dict[str, Any]]) -> bool
 # ---------------------------------------------------------------------------
 
 #: ``flocks/tool/security/metadata`` — kept here for legacy plugin JSON files.
-_LEGACY_METADATA_DIR = Path(__file__).resolve().parents[2] / "tool" / "security" / "metadata"
+#: Resolved as the sibling ``security/metadata`` directory under ``flocks/tool/``.
+_LEGACY_METADATA_DIR = Path(__file__).resolve().parent.parent / "security" / "metadata"
 
 
 def _load_provider_yaml_metadata(provider_id: str) -> Optional[Dict[str, Any]]:
@@ -97,9 +100,6 @@ def _load_provider_yaml_metadata(provider_id: str) -> Optional[Dict[str, Any]]:
     does not match ``provider_id`` still resolve correctly.
     """
     try:
-        from flocks.config.api_versioning import discover_api_service_descriptors
-        import yaml
-
         descriptor = next(
             (d for d in discover_api_service_descriptors()
              if provider_id in (d.storage_key, d.service_id)),

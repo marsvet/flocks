@@ -7,7 +7,6 @@ temperature, tool_call, limit, etc.
 """
 
 import time
-import json
 import re
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -21,9 +20,10 @@ from flocks.config.config import Config
 from flocks.config.config_writer import ConfigWriter
 from flocks.storage.storage import Storage
 from flocks.tool.tool_loader import extract_provider_version
-# Re-exported from flocks.tool.api_service.schema so that existing callers
-# (tests / onboarding / device migration) can keep importing them from this
-# module without churn. The canonical home is the schema module.
+
+# Schema helpers are re-exported from flocks.tool.api_service.schema (canonical
+# home). Existing callers — tests, onboarding, device migration — keep importing
+# them from this module without churn.
 from flocks.tool.api_service.schema import (
     APIServiceCredentialField,
     _build_api_service_credential_schema,

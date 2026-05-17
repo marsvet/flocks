@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Dict, FrozenSet, Optional, Tuple
 
+from flocks.tool.api_service.schema import _extract_secret_id as _parse_placeholder
 from flocks.utils.log import Log
 
 log = Log.create(service="tool.device.secrets")
@@ -29,17 +30,6 @@ _FALLBACK_SECRET_KEYS: FrozenSet[str] = frozenset(
 def _secret_id(device_id: str, field_key: str) -> str:
     """``device_<uuid>_<field_key>`` — unique, device-scoped secret name."""
     return f"device_{device_id}_{field_key}"
-
-
-def _parse_placeholder(value: object) -> Optional[str]:
-    """Return the secret-id inside ``{secret:…}`` or None if *value* is not a placeholder."""
-    if (
-        isinstance(value, str)
-        and value.startswith(_PLACEHOLDER_PREFIX)
-        and value.endswith(_PLACEHOLDER_SUFFIX)
-    ):
-        return value[len(_PLACEHOLDER_PREFIX):-len(_PLACEHOLDER_SUFFIX)]
-    return None
 
 
 def _secret_keys_for(storage_key: str) -> FrozenSet[str]:
