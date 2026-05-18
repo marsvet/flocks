@@ -1202,19 +1202,19 @@ class ToolRegistry:
 
         _tool_groups = [
             # file/ — filesystem operations
-            ("flocks.tool.file", ["read", "write", "edit", "multiedit", "apply_patch", "glob", "list_tool", "file_search", "doc_parser"]),
+            ("flocks.tool.file", ["read", "write", "edit", "apply_patch", "glob", "doc_parser"]),
             # code/ — code analysis + terminal
-            ("flocks.tool.code", ["bash", "grep", "codesearch", "lsp_tool"]),
+            ("flocks.tool.code", ["bash", "grep", "lsp_tool"]),
             # web/ — internet access
             ("flocks.tool.web", ["webfetch", "websearch"]),
             # agent/ — agent delegation/coordination
-            ("flocks.tool.agent", ["delegate_task", "call_omo_agent"]),
+            ("flocks.tool.agent", ["delegate_task"]),
             # task/ — task/workflow
-            ("flocks.tool.task", ["task", "task_center", "todo", "plan", "run_workflow", "run_workflow_node"]),
+            ("flocks.tool.task", ["task", "schedule_task_center", "todo", "plan", "run_workflow", "run_workflow_node"]),
             # security/ — SSH forensics + threat intelligence (optional: asyncssh)
             ("flocks.tool.security", ["ssh_host_cmd", "ssh_run_script"]),
-            # system/ — background tasks, questions, model config, memory, skill, batch, session management, slash commands
-            ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "batch", "session_manage", "slash_command", "tool_search"]),
+            # system/ — background tasks, questions, model config, memory, skill, MCP management, session management, slash commands
+            ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "flocks_mcp", "session_manage", "slash_command", "tool_search"]),
             # skill/ — skill management (search, install, status, deps, remove)
             ("flocks.tool.skill", ["flocks_skills"]),
             # channel/ — IM platform messaging
@@ -1229,32 +1229,19 @@ class ToolRegistry:
                 except ImportError as e:
                     log.warn("builtin_tools.import_failed", {"module": f"{package}.{mod_name}", "error": str(e)})
 
-        # Mark every tool registered during this call as native=True.
+        # Mark every tool registered during this call as native=True, except
+        # for built-in modules that should remain non-native by policy.
         # This is done in bulk here so individual @register_function call
         # sites don't need to pass native=True, and user plugin files using
         # the same decorator won't be misclassified.
+        builtin_native_exceptions = {"lsp"}
         for name in set(cls._tools.keys()) - before:
+            if name in builtin_native_exceptions:
+                cls._tools[name].info.native = False
+                continue
             cls._tools[name].info.native = True
 
         # Sample tools for testing (only register if not already registered)
-        if "echo" not in cls._tools:
-            @cls.register_function(
-                name="echo",
-                description="Echo back the input message",
-                category=ToolCategory.SYSTEM,
-                native=True,
-                parameters=[
-                    ToolParameter(
-                        name="message",
-                        type=ParameterType.STRING,
-                        description="Message to echo",
-                        required=True,
-                    )
-                ]
-            )
-            async def echo(ctx: ToolContext, message: str) -> ToolResult:
-                return ToolResult(success=True, output=message)
-
         if "get_time" not in cls._tools:
             @cls.register_function(
                 name="get_time",

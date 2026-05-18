@@ -17,7 +17,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from flocks.session.prompt import SessionPrompt, SystemPrompt, PromptTemplate
+from flocks.session.prompt import (
+    PROMPT_DEFAULT,
+    PromptTemplate,
+    SessionPrompt,
+    SystemPrompt,
+)
 from flocks.session import prompt_strings
 
 
@@ -219,18 +224,36 @@ class TestSystemPromptProvider:
     def test_anthropic_model_returns_list(self):
         result = SystemPrompt.provider("claude-3-5-sonnet-20241022")
         assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].startswith(PROMPT_DEFAULT.strip())
 
     def test_gemini_model_returns_list(self):
         result = SystemPrompt.provider("gemini-1.5-pro")
         assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].startswith(PROMPT_DEFAULT.strip())
 
     def test_gpt_model_returns_list(self):
         result = SystemPrompt.provider("gpt-4o")
         assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].startswith(PROMPT_DEFAULT.strip())
 
     def test_unknown_model_returns_list(self):
         result = SystemPrompt.provider("totally-unknown-model")
         assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].startswith(PROMPT_DEFAULT.strip())
+        assert "use the ls tool" not in result[0]
+        assert "must call the relevant tool" in result[0]
+
+    def test_minimax_model_uses_minimax_prompt(self):
+        result = SystemPrompt.provider("minimax:MiniMax-M2.5")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].startswith(PROMPT_DEFAULT.strip())
+        assert "prefer actually invoking the needed tool" in result[0]
+        assert "Misleading behavior" in result[0]
 
     def test_none_model_returns_list(self):
         # provider() may raise on None; just verify it returns a list or handle gracefully
@@ -242,21 +265,20 @@ class TestSystemPromptProvider:
 
 
 class TestPromptToolInstructions:
-    def test_windows_includes_shell_rules(self):
-        with patch.object(prompt_strings.platform, "system", return_value="Windows"):
-            instructions = prompt_strings._build_tool_instructions()
+    def test_tool_instructions_are_platform_agnostic(self):
+        instructions = prompt_strings._build_tool_instructions()
 
-        assert "do not assume GNU bash features" in instructions
-        assert "cat > file <<'EOF'" in instructions
-        assert "PowerShell-compatible syntax or Python" in instructions
+        assert "PowerShell" not in instructions
+        assert "must explicitly specify encoding" not in instructions
+        assert "Bash Tool Guidance" not in instructions
 
-    def test_non_windows_keeps_default_strategy(self):
-        with patch.object(prompt_strings.platform, "system", return_value="Darwin"):
-            instructions = prompt_strings._build_tool_instructions()
+    def test_tool_instructions_do_not_hardcode_tool_name_mapping(self):
+        instructions = prompt_strings._build_tool_instructions()
 
-        assert "do not assume GNU bash features" not in instructions
-        assert "PowerShell-compatible syntax or Python" not in instructions
-        assert "must explicitly specify encoding" in instructions
+        assert "callable schema" in instructions
+        assert "Read files: use the 'read' tool" not in instructions
+        assert "Run commands: use the 'bash' tool" not in instructions
+        assert "Search code: use the 'grep' tool" not in instructions
 
 
 # ---------------------------------------------------------------------------
