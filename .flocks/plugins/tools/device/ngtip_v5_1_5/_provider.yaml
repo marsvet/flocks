@@ -2,10 +2,7 @@ name: ngtip
 vendor: threatbook
 service_id: ngtip_api
 version: "5.1.5"
-<<<<<<<< HEAD:.flocks/plugins/tools/device/ngtip_v5_1_5/_provider.yaml
 integration_type: device
-========
->>>>>>>> fbd3c7045a1d713364c29f5c5da65a5441caa1fd:.flocks/plugins/tools/api/ngtip_v5_1_5/_provider.yaml
 description: >
   NGTIP (Next Generation Threat Intelligence Platform) API service.
   Covers two endpoint categories: intelligence query (port 8090) and

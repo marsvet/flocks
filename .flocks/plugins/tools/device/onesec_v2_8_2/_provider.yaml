@@ -2,10 +2,7 @@ name: onesec
 vendor: threatbook
 service_id: onesec_api
 version: "2.8.2"
-<<<<<<<< HEAD:.flocks/plugins/tools/device/onesec_v2_8_2/_provider.yaml
 integration_type: device
-========
->>>>>>>> fbd3c7045a1d713364c29f5c5da65a5441caa1fd:.flocks/plugins/tools/api/onesec_v2_8_2/_provider.yaml
 description: >
   OneSEC endpoint security platform API service. Configure API Key, Secret,
   and optional Base URL separately in the credentials form. Base URL defaults

@@ -2,10 +2,7 @@ name: TDP
 vendor: threatbook
 service_id: tdp_api
 version: "3.3.10"
-<<<<<<<< HEAD:.flocks/plugins/tools/device/tdp_v3_3_10/_provider.yaml
 integration_type: device
-========
->>>>>>>> fbd3c7045a1d713364c29f5c5da65a5441caa1fd:.flocks/plugins/tools/api/tdp_v3_3_10/_provider.yaml
 description: >
   TDP monitoring platform API for dashboard, threat investigation, asset risk,
   log search, MDR analysis, and system status queries.

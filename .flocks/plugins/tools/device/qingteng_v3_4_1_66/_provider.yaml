@@ -2,10 +2,7 @@ name: qingteng
 vendor: qingteng
 service_id: qingteng
 version: "3.4.1.66"
-<<<<<<<< HEAD:.flocks/plugins/tools/device/qingteng_v3_4_1_66/_provider.yaml
 integration_type: device
-========
->>>>>>>> fbd3c7045a1d713364c29f5c5da65a5441caa1fd:.flocks/plugins/tools/api/qingteng_v3_4_1_66/_provider.yaml
 description: QingTeng cloud security platform - host security, vulnerability detection, and intrusion monitoring.
 description_cn: 青藤云安全平台 - 主机安全、漏洞检测、入侵检测
 auth:
