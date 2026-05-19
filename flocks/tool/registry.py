@@ -626,7 +626,7 @@ class ToolRegistry:
             Agent.invalidate_cache()
         except Exception as e:
             log.debug("tool.revision.agent_invalidate_failed", {"error": str(e)})
-        log.info("tool.registry.revision.bumped", {"revision": cls._revision, "reason": reason})
+        log.debug("tool.registry.revision.bumped", {"revision": cls._revision, "reason": reason})
 
     @classmethod
     def register_function(
@@ -958,7 +958,7 @@ class ToolRegistry:
                 p for p, svc in api_services.items()
                 if not svc.get("enabled", False)
             ]
-            log.info("tool_registry.api_service_sync", {
+            log.debug("tool_registry.api_service_sync", {
                 "disabled_tools": disabled_count,
                 "disabled_providers": disabled_providers,
             })
@@ -1095,8 +1095,21 @@ class ToolRegistry:
             for spec in items:
                 # YAML factory produces Tool instances directly
                 if isinstance(spec, Tool):
-                    if spec.info.name in cls._tools:
-                        log.warn("plugin.tool.duplicate", {"source": source, "name": spec.info.name})
+                    existing = cls._tools.get(spec.info.name)
+                    if existing is not None:
+                        # ``PluginLoader.load_all()`` is invoked by multiple
+                        # subsystems (ToolRegistry, Agent registry, etc.).  A
+                        # re-scan that re-encounters the same plugin file is
+                        # idempotent and should not produce a noisy warning;
+                        # only flag genuine name collisions from a different
+                        # source.
+                        existing_source = getattr(existing.info, "source", None)
+                        if existing_source not in (None, "plugin_yaml", "plugin_py"):
+                            log.warn("plugin.tool.duplicate", {
+                                "source": source,
+                                "name": spec.info.name,
+                                "existing_source": existing_source,
+                            })
                         continue
                     if spec.info.source is None:
                         spec.info.source = "plugin_yaml"
@@ -1115,8 +1128,18 @@ class ToolRegistry:
                         "spec_keys": list(spec.keys()),
                     })
                     continue
-                if name in cls._tools:
-                    log.warn("plugin.tool.duplicate", {"source": source, "name": name})
+                existing = cls._tools.get(name)
+                if existing is not None:
+                    # Idempotent re-scan: same plugin source discovered again
+                    # via another ``PluginLoader.load_all()`` pass.  Only warn
+                    # on genuine cross-source collisions.
+                    existing_source = getattr(existing.info, "source", None)
+                    if existing_source not in (None, "plugin_yaml", "plugin_py"):
+                        log.warn("plugin.tool.duplicate", {
+                            "source": source,
+                            "name": name,
+                            "existing_source": existing_source,
+                        })
                     continue
 
                 if isinstance(handler, str):
@@ -1179,19 +1202,19 @@ class ToolRegistry:
 
         _tool_groups = [
             # file/ — filesystem operations
-            ("flocks.tool.file", ["read", "write", "edit", "multiedit", "apply_patch", "glob", "list_tool", "file_search", "doc_parser"]),
+            ("flocks.tool.file", ["read", "write", "edit", "apply_patch", "glob", "doc_parser"]),
             # code/ — code analysis + terminal
-            ("flocks.tool.code", ["bash", "grep", "codesearch", "lsp_tool"]),
+            ("flocks.tool.code", ["bash", "grep", "lsp_tool"]),
             # web/ — internet access
             ("flocks.tool.web", ["webfetch", "websearch"]),
             # agent/ — agent delegation/coordination
-            ("flocks.tool.agent", ["delegate_task", "call_omo_agent"]),
+            ("flocks.tool.agent", ["delegate_task"]),
             # task/ — task/workflow
-            ("flocks.tool.task", ["task", "task_center", "todo", "plan", "run_workflow", "run_workflow_node"]),
+            ("flocks.tool.task", ["task", "schedule_task_center", "todo", "plan", "run_workflow", "run_workflow_node"]),
             # security/ — SSH forensics + threat intelligence (optional: asyncssh)
             ("flocks.tool.security", ["ssh_host_cmd", "ssh_run_script"]),
-            # system/ — background tasks, questions, model config, memory, skill, batch, session management, slash commands
-            ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "batch", "session_manage", "slash_command", "tool_search"]),
+            # system/ — background tasks, questions, model config, memory, skill, MCP management, session management, slash commands
+            ("flocks.tool.system", ["background_output", "background_cancel", "question", "model_config", "memory", "skill", "flocks_mcp", "session_manage", "slash_command", "tool_search"]),
             # skill/ — skill management (search, install, status, deps, remove)
             ("flocks.tool.skill", ["flocks_skills"]),
             # channel/ — IM platform messaging
@@ -1206,32 +1229,19 @@ class ToolRegistry:
                 except ImportError as e:
                     log.warn("builtin_tools.import_failed", {"module": f"{package}.{mod_name}", "error": str(e)})
 
-        # Mark every tool registered during this call as native=True.
+        # Mark every tool registered during this call as native=True, except
+        # for built-in modules that should remain non-native by policy.
         # This is done in bulk here so individual @register_function call
         # sites don't need to pass native=True, and user plugin files using
         # the same decorator won't be misclassified.
+        builtin_native_exceptions = {"lsp"}
         for name in set(cls._tools.keys()) - before:
+            if name in builtin_native_exceptions:
+                cls._tools[name].info.native = False
+                continue
             cls._tools[name].info.native = True
 
         # Sample tools for testing (only register if not already registered)
-        if "echo" not in cls._tools:
-            @cls.register_function(
-                name="echo",
-                description="Echo back the input message",
-                category=ToolCategory.SYSTEM,
-                native=True,
-                parameters=[
-                    ToolParameter(
-                        name="message",
-                        type=ParameterType.STRING,
-                        description="Message to echo",
-                        required=True,
-                    )
-                ]
-            )
-            async def echo(ctx: ToolContext, message: str) -> ToolResult:
-                return ToolResult(success=True, output=message)
-
         if "get_time" not in cls._tools:
             @cls.register_function(
                 name="get_time",
@@ -1472,6 +1482,42 @@ class ToolRegistry:
 # ---------------------------------------------------------------------------
 
 
+def _tool_event_should_reload(event: object) -> bool:
+    """Return True if a watchdog filesystem event should trigger a plugin reload.
+
+    Atomic-save editors (vim, VS Code "useAtomicSave", many GUI tools, …)
+    persist edits by writing a sibling temp file then ``rename`` ing it onto
+    the real target.  watchdog surfaces this as a ``moved`` event whose
+    ``src_path`` is the throwaway temp filename and whose ``dest_path`` is the
+    real ``tool.yaml`` / ``*.py``.  Filtering only by ``src_path`` (the
+    pre-fix behaviour) misses the real edit entirely, so we have to inspect
+    both endpoints.
+
+    Exposed at module scope so it can be unit-tested without spinning up
+    ``watchdog.observers.Observer`` against a temp directory.
+    """
+    candidate_paths: List[str] = []
+    src = getattr(event, "src_path", "") or ""
+    if src:
+        candidate_paths.append(src)
+    dest = getattr(event, "dest_path", "") or ""
+    if dest:
+        candidate_paths.append(dest)
+    if not candidate_paths:
+        return False
+
+    for path in candidate_paths:
+        if not (path.endswith(".yaml") or path.endswith(".py")):
+            continue
+        fname = os.path.basename(path)
+        # Ignore Python bytecode / temp / hidden files that get touched
+        # during normal imports but never carry plugin definitions.
+        if fname.startswith(".") or fname.startswith("_") or "/__pycache__/" in path:
+            continue
+        return True
+    return False
+
+
 class ToolFileWatcher:
     """Watch plugin tool directories and auto-reload plugin tools on change.
 
@@ -1523,13 +1569,23 @@ class ToolFileWatcher:
 
         watcher = self
 
+        # Only react to events that change file CONTENT.  watchdog also emits
+        # ``opened``/``closed``/``closed_no_write`` events whenever any process
+        # (including this one) reads a YAML/Python file, and ``refresh_plugin_tools``
+        # itself opens every plugin tool file on every reload.  Listening to those
+        # access events creates an infinite reload feedback loop where the watcher
+        # endlessly re-triggers itself every ~debounce-window seconds.
+        _RELOAD_EVENT_TYPES = frozenset({"modified", "created", "deleted", "moved"})
+
         class _Handler(FileSystemEventHandler):
             def on_any_event(self, event: FileSystemEvent) -> None:
                 if event.is_directory:
                     return
-                src = getattr(event, "src_path", "") or ""
-                if src.endswith(".yaml") or src.endswith(".py"):
-                    watcher._schedule_refresh()
+                if getattr(event, "event_type", "") not in _RELOAD_EVENT_TYPES:
+                    return
+                if not _tool_event_should_reload(event):
+                    return
+                watcher._schedule_refresh()
 
         handler = _Handler()
         observer = Observer()
@@ -1583,7 +1639,7 @@ class ToolFileWatcher:
     def _run_refresh(self) -> None:
         try:
             ToolRegistry.refresh_plugin_tools()
-            log.info("tool.watcher.reloaded", {"reason": "plugin tool file changed on disk"})
+            log.debug("tool.watcher.reloaded", {"reason": "plugin tool file changed on disk"})
         except Exception as e:
             log.warn("tool.watcher.reload_failed", {"error": str(e)})
 
