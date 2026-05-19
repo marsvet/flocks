@@ -1,13 +1,14 @@
 """
-Task Center Tools for Rex
+Schedule Task Center Tools for Rex
 
-Registers task management tools into ToolRegistry so Rex can
-create, list, update, delete, and query tasks via natural language.
+Registers scheduled task management tools into ToolRegistry so Rex can
+create, list, update, delete, and query delayed tasks via natural language.
 """
 
 import json
 from typing import Optional
 
+from flocks.task.formatting import format_task_datetime, resolve_task_timezone_name
 from flocks.tool.registry import (
     ParameterType,
     ToolCategory,
@@ -40,7 +41,7 @@ def _coerce_legacy_bool(value: object, *, default: bool = False) -> bool:
     return default
 
 
-def _normalize_task_create_inputs(
+def _normalize_schedule_task_create_inputs(
     type_value: Optional[str],
     schedule_type: Optional[str],
     run_once: bool,
@@ -50,7 +51,7 @@ def _normalize_task_create_inputs(
     timezone: str,
     schedule: Optional[str],
 ) -> tuple[Optional[str], bool, Optional[str], Optional[str], Optional[str], str]:
-    """Accept common task_create aliases and infer scheduled tasks."""
+    """Accept common schedule_task_create aliases and infer scheduled tasks."""
     schedule_data: dict[str, object] = {}
     if schedule:
         normalized_schedule = schedule.strip()
@@ -107,11 +108,11 @@ def _normalize_task_create_inputs(
 
 
 # ======================================================================
-# task_create
+# schedule_task_create
 # ======================================================================
 
 @ToolRegistry.register_function(
-    name="task_create",
+    name="schedule_task_create",
     description=(
         "Create a new task (queued, one-time scheduled, or recurring scheduled). "
         "Only call this when the user explicitly asks for deferred/delayed execution "
@@ -130,7 +131,7 @@ def _normalize_task_create_inputs(
         "IMPORTANT — IM session resolution before creating:\n"
         "If the task involves sending a message to an IM platform (企业微信/WeCom、飞书/Feishu、钉钉/DingTalk), "
         "you MUST resolve the target session_id and channel_type BEFORE calling this tool "
-        "(follow the IM Session Resolution for task_create protocol in your system prompt). "
+        "(follow the IM Session Resolution for schedule_task_create protocol in your system prompt). "
         "Embed both into description and user_prompt. "
         "If the user cannot provide a session_id, do NOT create the task."
     ),
@@ -278,13 +279,13 @@ def _normalize_task_create_inputs(
             type=ParameterType.STRING,
             description=(
                 "Legacy compatibility field sometimes sent by models during task creation. "
-                "Ignored by task_create."
+                "Ignored by schedule_task_create."
             ),
             required=False,
         ),
     ],
 )
-async def task_create(
+async def schedule_task_create(
     ctx: ToolContext,
     title: str,
     description: str,
@@ -312,7 +313,7 @@ async def task_create(
 
     del action
 
-    type, run_once, run_at, cron, cron_description, timezone = _normalize_task_create_inputs(
+    type, run_once, run_at, cron, cron_description, timezone = _normalize_schedule_task_create_inputs(
         type,
         schedule_type,
         run_once,
@@ -362,6 +363,7 @@ async def task_create(
     if enabled is False:
         scheduler = await TaskManager.disable_scheduler(scheduler.id) or scheduler
 
+    display_tz = resolve_task_timezone_name(scheduler)
     output_lines = [
         f"ID: {scheduler.id}",
         f"Title: {scheduler.title}",
@@ -379,11 +381,17 @@ async def task_create(
             output_lines.append(f"Execution ID: {execution.id}")
             output_lines.append(f"Execution Status: {execution.status.value}")
     elif scheduler.trigger.run_at:
-        output_lines.append(f"Run at: {scheduler.trigger.run_at.isoformat()}")
+        output_lines.append(
+            f"Run at: {format_task_datetime(scheduler.trigger.run_at, display_tz)}"
+        )
     elif scheduler.trigger.cron:
-        output_lines.append(f"Cron: {scheduler.trigger.cron}")
+        output_lines.append(
+            f"Cron: {scheduler.trigger.cron} ({scheduler.trigger.timezone})"
+        )
         if scheduler.trigger.next_run:
-            output_lines.append(f"Next run: {scheduler.trigger.next_run.isoformat()}")
+            output_lines.append(
+                f"Next run: {format_task_datetime(scheduler.trigger.next_run, display_tz)}"
+            )
 
     return ToolResult(
         success=True,
@@ -393,7 +401,7 @@ async def task_create(
 
 
 # ======================================================================
-# task_list
+# schedule_task_list
 # ======================================================================
 
 _SCHEDULER_STATUSES = {"active", "disabled", "paused"}
@@ -403,7 +411,7 @@ _VALID_TYPES = {"scheduled"} | _EXECUTION_TYPES
 
 
 @ToolRegistry.register_function(
-    name="task_list",
+    name="schedule_task_list",
     description=(
         "List tasks with optional filters.\n\n"
         "Routing rules (IMPORTANT - read before calling):\n"
@@ -462,7 +470,7 @@ _VALID_TYPES = {"scheduled"} | _EXECUTION_TYPES
         ),
     ],
 )
-async def task_list(
+async def schedule_task_list(
     ctx: ToolContext,
     status: Optional[str] = None,
     type: Optional[str] = None,
@@ -548,11 +556,11 @@ async def task_list(
 
 
 # ======================================================================
-# task_status
+# schedule_task_status
 # ======================================================================
 
 @ToolRegistry.register_function(
-    name="task_status",
+    name="schedule_task_status",
     description="Get detailed status and result of a specific task",
     category=ToolCategory.SYSTEM,
     parameters=[
@@ -564,7 +572,7 @@ async def task_list(
         ),
     ],
 )
-async def task_status(ctx: ToolContext, task_id: str) -> ToolResult:
+async def schedule_task_status(ctx: ToolContext, task_id: str) -> ToolResult:
     from flocks.task.manager import TaskManager
 
     task = await TaskManager.get_execution(task_id)
@@ -583,11 +591,11 @@ async def task_status(ctx: ToolContext, task_id: str) -> ToolResult:
 
 
 # ======================================================================
-# task_update
+# schedule_task_update
 # ======================================================================
 
 @ToolRegistry.register_function(
-    name="task_update",
+    name="schedule_task_update",
     description=(
         "Update a task. By default action=update, which can modify scheduler "
         "fields like title, description, priority, cron, run_once, run_at, "
@@ -603,13 +611,13 @@ async def task_status(ctx: ToolContext, task_id: str) -> ToolResult:
         "`cron_description` that reflect the new schedule, otherwise the task "
         "title shown in the UI may remain the old wording.\n\n"
         "Good example for recurring schedule update:\n"
-        "task_update(task_id='tsk_xxx', cron='*/10 * * * *', "
+        "schedule_task_update(task_id='tsk_xxx', cron='*/10 * * * *', "
         "title='每10分钟执行关键词搜索摘要生成工作流', "
         "cron_description='每10分钟执行一次')\n"
         "Good example for stopping a scheduled task:\n"
-        "task_update(task_id='tsk_xxx', action='disable')\n"
+        "schedule_task_update(task_id='tsk_xxx', action='disable')\n"
         "Bad example:\n"
-        "task_update(task_id='tsk_xxx', fields='{\"cron\":\"*/10 * * * *\"}')"
+        "schedule_task_update(task_id='tsk_xxx', fields='{\"cron\":\"*/10 * * * *\"}')"
     ),
     category=ToolCategory.SYSTEM,
     parameters=[
@@ -705,7 +713,7 @@ async def task_status(ctx: ToolContext, task_id: str) -> ToolResult:
         ),
     ],
 )
-async def task_update(
+async def schedule_task_update(
     ctx: ToolContext,
     task_id: str,
     action: str = "update",
@@ -778,11 +786,11 @@ async def task_update(
 
 
 # ======================================================================
-# task_delete
+# schedule_task_delete
 # ======================================================================
 
 @ToolRegistry.register_function(
-    name="task_delete",
+    name="schedule_task_delete",
     description="Delete a task permanently",
     category=ToolCategory.SYSTEM,
     parameters=[
@@ -794,7 +802,7 @@ async def task_update(
         ),
     ],
 )
-async def task_delete(ctx: ToolContext, task_id: str) -> ToolResult:
+async def schedule_task_delete(ctx: ToolContext, task_id: str) -> ToolResult:
     from flocks.task.manager import TaskManager
 
     execution = await TaskManager.get_execution(task_id)
@@ -808,11 +816,11 @@ async def task_delete(ctx: ToolContext, task_id: str) -> ToolResult:
 
 
 # ======================================================================
-# task_rerun
+# schedule_task_rerun
 # ======================================================================
 
 @ToolRegistry.register_function(
-    name="task_rerun",
+    name="schedule_task_rerun",
     description="Rerun a task. If it is active, it will be cancelled and a new execution will be created.",
     category=ToolCategory.SYSTEM,
     parameters=[
@@ -824,7 +832,7 @@ async def task_delete(ctx: ToolContext, task_id: str) -> ToolResult:
         ),
     ],
 )
-async def task_rerun(ctx: ToolContext, task_id: str) -> ToolResult:
+async def schedule_task_rerun(ctx: ToolContext, task_id: str) -> ToolResult:
     from flocks.task.manager import TaskManager
 
     task = await TaskManager.rerun_execution(task_id)
@@ -864,6 +872,7 @@ def _format_task_line(t) -> str:
 def _format_task(t) -> str:
     mode_value = getattr(getattr(t, "mode", None), "value", getattr(t, "mode", None))
     trigger = getattr(t, "trigger", None)
+    display_tz = resolve_task_timezone_name(t)
     if mode_value == "cron":
         type_value = "scheduled"
     elif getattr(trigger, "run_immediately", False):
@@ -882,24 +891,26 @@ def _format_task(t) -> str:
     ]
     if trigger is not None:
         if trigger.run_at:
-            lines.append(f"Run at: {trigger.run_at.isoformat()}")
+            lines.append(f"Run at: {format_task_datetime(trigger.run_at, display_tz)}")
         if trigger.cron:
             lines.append(f"Cron: {trigger.cron} ({trigger.timezone})")
         if trigger.next_run:
-            lines.append(f"Next run: {trigger.next_run.isoformat()}")
+            lines.append(
+                f"Next run: {format_task_datetime(trigger.next_run, display_tz)}"
+            )
         if trigger.cron_description:
             lines.append(f"Schedule desc: {trigger.cron_description}")
     if getattr(t, "queued_at", None):
-        lines.append(f"Queued: {t.queued_at.isoformat()}")
+        lines.append(f"Queued: {format_task_datetime(t.queued_at, display_tz)}")
     if getattr(t, "started_at", None):
-        lines.append(f"Started: {t.started_at.isoformat()}")
+        lines.append(f"Started: {format_task_datetime(t.started_at, display_tz)}")
     if getattr(t, "completed_at", None):
-        lines.append(f"Completed: {t.completed_at.isoformat()}")
+        lines.append(f"Completed: {format_task_datetime(t.completed_at, display_tz)}")
     if getattr(t, "duration_ms", None) is not None:
         lines.append(f"Duration: {t.duration_ms}ms")
     if getattr(t, "result_summary", None):
         lines.append(f"Result:\n{t.result_summary}")
     if getattr(t, "error", None):
         lines.append(f"Error: {t.error}")
-    lines.append(f"Created: {t.created_at.isoformat()}")
+    lines.append(f"Created: {format_task_datetime(t.created_at, display_tz)}")
     return "\n".join(lines)

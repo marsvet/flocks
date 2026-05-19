@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   BookOpen,
   Search,
@@ -32,7 +32,7 @@ export default function SkillPage() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [installingDeps, setInstallingDeps] = useState<Record<string, boolean>>({});
-  const toast = useToast();
+  const { error: showErrorToast, success: showSuccessToast } = useToast();
 
   const [sheetSkill, setSheetSkill] = useState<Skill | null>(null);
   const [showCreateSheet, setShowCreateSheet] = useState(false);
@@ -48,8 +48,12 @@ export default function SkillPage() {
   // the Tool list page's column-filter behavior.
   const [enabledFilter, setEnabledFilter] = useState<Set<string>>(new Set());
   const [sourceColFilter, setSourceColFilter] = useState<Set<string>>(new Set());
+  // Throttle anchor for `refreshSkillsAndFetch` — visibility/focus listeners
+  // can fire several times in a single second; without this guard the page
+  // would hammer the backend every time the tab gets focus.
+  const lastRefreshRef = useRef(0);
 
-  const fetchSkills = async (
+  const fetchSkills = useCallback(async (
     { silent = false, invalidateOnError = false }: { silent?: boolean; invalidateOnError?: boolean } = {}
   ) => {
     try {
@@ -74,7 +78,7 @@ export default function SkillPage() {
           setError(message);
         }
         if (silent) {
-          toast.error(t('refreshFailed'), message);
+          showErrorToast(t('refreshFailed'), message);
         }
         return false;
       }
@@ -83,11 +87,11 @@ export default function SkillPage() {
         setLoading(false);
       }
     }
-  };
+  }, [showErrorToast, t]);
 
   useEffect(() => {
-    fetchSkills();
-  }, []);
+    void fetchSkills();
+  }, [fetchSkills]);
 
   // Skills visible to this page: everything except the internal "system"
   // category.  Counter chips operate on this set so the totals reflect
@@ -151,38 +155,75 @@ export default function SkillPage() {
     [filteredSkills, currentPage],
   );
 
-  const handleRefresh = async () => {
-    if (refreshing) return;
-    try {
-      setRefreshing(true);
-      await Promise.all([
-        skillAPI.refresh().then(() => fetchSkills({ silent: true })),
-        new Promise((r) => setTimeout(r, 600)),
-      ]);
-      setRefreshDone(true);
-      setTimeout(() => setRefreshDone(false), 2000);
-    } catch (err: unknown) {
-      toast.error(t('refreshFailed'), err instanceof Error ? err.message : String(err));
-    } finally {
-      setRefreshing(false);
-    }
-  };
+  const refreshSkillsAndFetch = useCallback(async (
+    {
+      silent = true,
+      invalidateOnError = true,
+      force = false,
+    }: {
+      silent?: boolean;
+      invalidateOnError?: boolean;
+      force?: boolean;
+    } = {}
+  ) => {
+    const now = Date.now();
+    if (!force && now - lastRefreshRef.current < 1000) return true;
+    lastRefreshRef.current = now;
 
-  const refreshSkillsAndFetch = async () => {
     try {
       await skillAPI.refresh();
     } catch {
       // Fall back to a plain fetch if refresh is temporarily unavailable.
     }
-    return fetchSkills({ silent: true, invalidateOnError: true });
+    return fetchSkills({ silent, invalidateOnError });
+  }, [fetchSkills]);
+
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    try {
+      setRefreshing(true);
+      // Ensure a minimum spin duration so the animation is clearly visible
+      const [ok] = await Promise.all([
+        refreshSkillsAndFetch({ silent: true, invalidateOnError: true, force: true }),
+        new Promise((r) => setTimeout(r, 600)),
+      ]);
+      if (!ok) {
+        showErrorToast(t('refreshFailed'), t('fetchListFailed'));
+        return;
+      }
+      setRefreshDone(true);
+      setTimeout(() => setRefreshDone(false), 2000);
+    } finally {
+      setRefreshing(false);
+    }
   };
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshSkillsAndFetch({ silent: true, invalidateOnError: false });
+      }
+    };
+
+    const handleWindowFocus = () => {
+      void refreshSkillsAndFetch({ silent: true, invalidateOnError: false });
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleWindowFocus);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, [refreshSkillsAndFetch]);
 
   const handleSelectSkill = async (skill: Skill) => {
     try {
       const response = await skillAPI.get(skill.name);
       setSheetSkill(response.data);
     } catch (err: unknown) {
-      toast.error(t('fetchDetailFailed'), err instanceof Error ? err.message : String(err));
+      showErrorToast(t('fetchDetailFailed'), err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -197,7 +238,7 @@ export default function SkillPage() {
         s.name === skill.name ? { ...s, disabled: res.data.disabled } : s
       ));
     } catch (err: unknown) {
-      toast.error(t('toggle.failed'), err instanceof Error ? err.message : String(err));
+      showErrorToast(t('toggle.failed'), err instanceof Error ? err.message : String(err));
     } finally {
       setTogglingSkills(prev => ({ ...prev, [skill.name]: false }));
     }
@@ -210,17 +251,17 @@ export default function SkillPage() {
       const res = await skillAPI.installDeps(skill.name);
       const allOk = res.data.results.every(r => r.success);
       if (allOk) {
-        toast.success(t('eligibility.installSuccess'));
-        await fetchSkills({ silent: true, invalidateOnError: true });
+        showSuccessToast(t('eligibility.installSuccess'));
+        await refreshSkillsAndFetch({ silent: true, invalidateOnError: true, force: true });
       } else {
         const errors = res.data.results
           .filter(r => !r.success)
           .map(r => r.error || 'unknown error')
           .join('; ');
-        toast.error(t('eligibility.installFailed'), errors);
+        showErrorToast(t('eligibility.installFailed'), errors);
       }
     } catch (err: unknown) {
-      toast.error(t('installDepsFailed'), err instanceof Error ? err.message : String(err));
+      showErrorToast(t('installDepsFailed'), err instanceof Error ? err.message : String(err));
     } finally {
       setInstallingDeps(prev => ({ ...prev, [skill.name]: false }));
     }
@@ -243,7 +284,7 @@ export default function SkillPage() {
       <div className="flex items-center justify-center h-full">
         <div className="text-center">
           <p className="text-red-600 mb-4">{error}</p>
-          <button onClick={() => fetchSkills()} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">
+          <button onClick={() => void refreshSkillsAndFetch({ silent: false, invalidateOnError: true, force: true })} className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700">
             {t('common:button.retry')}
           </button>
         </div>
@@ -396,11 +437,11 @@ export default function SkillPage() {
           skill={sheetSkill}
           onClose={() => setSheetSkill(null)}
           onSaved={async () => {
-            await fetchSkills({ silent: true, invalidateOnError: true });
+            await refreshSkillsAndFetch({ silent: true, invalidateOnError: true, force: true });
             setSheetSkill(null);
           }}
           onDeleted={async () => {
-            await fetchSkills({ silent: true, invalidateOnError: true });
+            await refreshSkillsAndFetch({ silent: true, invalidateOnError: true, force: true });
             setSheetSkill(null);
           }}
         />
@@ -408,10 +449,13 @@ export default function SkillPage() {
 
       {showCreateSheet && (
         <SkillSheet
-          onClose={() => setShowCreateSheet(false)}
+          onClose={() => {
+            setShowCreateSheet(false);
+            void refreshSkillsAndFetch({ silent: true, invalidateOnError: false, force: true });
+          }}
           onSaved={async () => {
             setShowCreateSheet(false);
-            await refreshSkillsAndFetch();
+            await refreshSkillsAndFetch({ silent: true, invalidateOnError: true, force: true });
           }}
         />
       )}

@@ -82,7 +82,7 @@ When to use:
 How to use:
 - Provide the workflow definition (dictionary, JSON string, or file path).
 - The workflow file path should be an absolute path. IMPORTANT: In JSON, file paths must be quoted strings (e.g. "workflow": "/path/to/workflow.json"). Unquoted paths will cause parse errors.
-- Optional: Provide input parameters, timeout settings, and whether to use LLM for logic node codegen.
+- Parameters: Provide input parameters, timeout settings. If inputs are not provided, ask user to provide them.
 
 Note:
 - This tool depends on an existing workflow file.
@@ -94,6 +94,32 @@ DESCRIPTION = _BASE_DESCRIPTION
 _DESCRIPTION_CACHE: Optional[str] = None
 _DESCRIPTION_CACHE_AT: float = 0.0
 _DESCRIPTION_CACHE_TTL: float = 60.0  # seconds
+
+
+def _create_nested_tool_context(ctx: ToolContext) -> ToolContext:
+    """Create an isolated child ToolContext for workflow node tools.
+
+    Workflow execution itself should surface workflow-level progress via
+    ``run_workflow`` metadata. Reusing the outer tool context inside workflow
+    nodes lets nested tools (notably ``task``) overwrite that metadata with
+    child-session progress, which makes the UI misclassify the outer workflow
+    card as a delegate/subagent card.
+
+    We therefore clone the context but intentionally omit the metadata
+    callback, while preserving permissions, event publishing, abort signal, and
+    sandbox/session identity.
+    """
+    return ToolContext(
+        session_id=ctx.session_id,
+        message_id=ctx.message_id,
+        agent=ctx.agent,
+        call_id=ctx.call_id,
+        extra=dict(ctx.extra),
+        abort_event=ctx.abort,
+        permission_callback=ctx._permission_callback,
+        metadata_callback=None,
+        event_publish_callback=ctx.event_publish_callback,
+    )
 
 
 async def _build_description() -> str:
@@ -565,6 +591,7 @@ async def run_workflow_tool(
         })
         execution_started_at = time.time()
 
+        nested_tool_ctx = _create_nested_tool_context(ctx)
         call_kwargs: Dict[str, Any] = {
             "workflow": workflow_source,
             "inputs": workflow_inputs,
@@ -574,7 +601,7 @@ async def run_workflow_tool(
             ),
             "timeout_s": timeout_s,
             "trace": trace,
-            "tool_context": ctx,
+            "tool_context": nested_tool_ctx,
         }
 
         # Backward-compatibility: older runtimes may not accept `use_llm`.

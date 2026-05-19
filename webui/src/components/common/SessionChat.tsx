@@ -2333,6 +2333,20 @@ function ChatMessageBubbleInner({
 // ChatToolPart — collapsible tool call card
 // ============================================================================
 
+const TOOL_DISPLAY_MAX_LEN = 120;
+
+/** Truncate long tool titles / param summaries shown in the card header. */
+export function truncateToolDisplayText(text: string, maxLen = TOOL_DISPLAY_MAX_LEN): string {
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen)}…`;
+}
+
+function buildToolInputSummary(input: Record<string, unknown>): string {
+  return Object.entries(input)
+    .map(([k, v]) => `${k}=${String(v)}`)
+    .join(', ');
+}
+
 export interface ChatToolPartProps {
   part: MessagePart;
   pendingQuestion?: PendingQuestion;
@@ -2399,11 +2413,12 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
     return JSON.stringify(output, null, 2);
   };
 
+  // Reuse the shared helpers so the truncation rules stay in sync with the
+  // delegate-task card and any other places that render tool input previews.
   const inputSummary = state.input
-    ? Object.entries(state.input as Record<string, unknown>)
-        .map(([k, v]) => `${k}=${String(v).slice(0, 20)}${String(v).length > 20 ? '…' : ''}`)
-        .join('  ')
+    ? truncateToolDisplayText(buildToolInputSummary(state.input))
     : '';
+  const displayTitle = state.title ? truncateToolDisplayText(state.title) : '';
 
   if (isWaitingForAnswer) {
     // Outer spacing is owned by the part wrapper in SessionChat's parts map.
@@ -2428,10 +2443,22 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
         <span className={`${config.iconColor} flex-shrink-0`}>{config.icon}</span>
         <span className="font-medium text-zinc-700 text-xs whitespace-nowrap flex-shrink-0">{toolName.replace(/_/g, ' ')}</span>
         {inputSummary && (
-          <span className="text-[11px] text-zinc-400 font-mono truncate min-w-0">{inputSummary}</span>
+          <span
+            className="text-[11px] text-zinc-400 font-mono truncate min-w-0"
+            // Show the un-truncated input on hover so dense tool calls
+            // (e.g. multi-argument MCP invocations) remain inspectable.
+            title={state.input ? buildToolInputSummary(state.input) : undefined}
+          >
+            {inputSummary}
+          </span>
         )}
-        {state.title && !inputSummary && (
-          <span className="text-[11px] text-zinc-400 truncate min-w-0">{state.title}</span>
+        {displayTitle && !inputSummary && (
+          <span
+            className="text-[11px] text-zinc-400 truncate min-w-0"
+            title={state.title}
+          >
+            {displayTitle}
+          </span>
         )}
         <div className="ml-auto flex items-center gap-1.5 flex-shrink-0">
           <span className={`text-[11px] font-medium px-1.5 py-0.5 rounded-md ${config.pill}`}>

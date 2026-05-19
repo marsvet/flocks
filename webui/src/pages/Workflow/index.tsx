@@ -79,11 +79,12 @@ export default function WorkflowPage() {
     if (refreshing) return;
     try {
       setRefreshing(true);
-      await Promise.all([refetch(), new Promise(r => setTimeout(r, 600))]);
+      await Promise.all([
+        refetch(),
+        new Promise((r) => setTimeout(r, 600)),
+      ]);
       setRefreshDone(true);
       setTimeout(() => setRefreshDone(false), 2000);
-    } catch {
-      // best-effort
     } finally {
       setRefreshing(false);
     }
@@ -129,6 +130,9 @@ export default function WorkflowPage() {
         title={t('pageTitle')}
         description={t('pageDescription')}
         icon={<WorkflowIcon className="w-8 h-8" />}
+        // Refresh / create actions intentionally moved to the toolbar below so
+        // the page header stays uniform with Skill/Agent pages and the
+        // segmented source filter shares a row with its primary actions.
       />
 
       {/* Toolbar */}
@@ -254,7 +258,10 @@ function WorkflowSection({
   const displayed = workflows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
   return (
-    <div>
+    // Use a labelled <section> so the grouping is exposed as a landmark
+    // region to assistive tech and to `getByRole('region', { name: title })`
+    // in tests; visual styling is unchanged from the previous bare <div>.
+    <section aria-label={title}>
       {/* Section header — same style as Agent page */}
       <div className="flex items-start gap-3 mb-4 pl-3 border-l-2 border-slate-300">
         <span className="text-slate-400 mt-0.5">{icon}</span>
@@ -308,7 +315,7 @@ function WorkflowSection({
           </div>
         </div>
       )}
-    </div>
+    </section>
   );
 }
 

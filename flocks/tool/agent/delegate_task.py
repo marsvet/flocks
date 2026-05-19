@@ -115,7 +115,7 @@ async def _find_completed_delegate(
             for p in parts:
                 if not isinstance(p, ToolPart):
                     continue
-                if p.tool not in ("delegate_task", "call_omo_agent"):
+                if p.tool != "delegate_task":
                     continue
                 state = p.state
                 if getattr(state, "status", None) != "completed":
@@ -190,16 +190,34 @@ def _derive_task_description(
         return f"continue task {session_id}"
     return "delegate task"
 
+# ------------------------------------------------------------------
+# Tool definition
+# ------------------------------------------------------------------
+
+DESCRIPTION = """Spawn agent task with category-based or direct agent selection. "
+
+Use this tool when:
+- The task requires multiple steps or research
+- You need to explore code in parallel
+- The task can be delegated to a specialized agent
+
+Usage notes:
+- Provide a clear description (3-5 words)
+- Provide detailed prompt with context
+- run_in_background=true: returns task_id immediately, collect results later with background_output
+- run_in_background=false: waits for completion and returns results inline
+- Pass session_id to continue a previous agent with full context
+
+REQUIRED: prompt.
+LOAD_SKILLS is optional and defaults to [].
+DESCRIPTION is optional and will be auto-derived when omitted.
+RUN_IN_BACKGROUND defaults to false (sync).
+USE EITHER subagent_type OR category — NEVER both simultaneously.
+"""
+
 @ToolRegistry.register_function(
     name="delegate_task",
-    description=(
-        "Spawn agent task with category-based or direct agent selection. "
-        "REQUIRED: prompt. "
-        "load_skills is optional and defaults to []. "
-        "description is optional and will be auto-derived when omitted. "
-        "run_in_background defaults to false (sync). "
-        "Use EITHER subagent_type OR category — NEVER both simultaneously."
-    ),
+    description=DESCRIPTION,
     category=ToolCategory.SYSTEM,
     parameters=[
         ToolParameter(
@@ -236,7 +254,7 @@ def _derive_task_description(
         ToolParameter(
             name="subagent_type",
             type=ParameterType.STRING,
-            description="Agent name. Mutually exclusive with category — use ONE or the other, never both.",
+            description="Agent name. Mutually exclusive with category — use ONE or the other, never both. Must be a delegatable agent",
             required=False,
         ),
         ToolParameter(
@@ -461,6 +479,6 @@ async def delegate_task_tool(
         loop_result=result,
         metadata=forwarder.final_metadata,
     )
-    result_status = "running" if tool_result.success else "error"
+    result_status = "completed" if tool_result.success else "error"
     ctx.metadata({"title": description, "metadata": {**forwarder.final_metadata, "status": result_status}})
     return tool_result

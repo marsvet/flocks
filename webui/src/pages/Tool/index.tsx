@@ -349,7 +349,7 @@ export default function ToolPage() {
     try {
       setRefreshing(true);
       await Promise.all([
-        toolAPI.refresh().then(() => refetch()),
+        refreshToolData(),
         new Promise((r) => setTimeout(r, 600)),
       ]);
       setRefreshDone(true);
@@ -420,7 +420,7 @@ export default function ToolPage() {
       <div className="flex items-center justify-center h-full">
         <div className="text-center">
           <p className="text-red-600 mb-4">{error}</p>
-          <button onClick={() => refetch()} className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800">
+          <button onClick={() => void refreshToolData()} className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800">
             {t('button.retry')}
           </button>
         </div>
@@ -637,7 +637,7 @@ export default function ToolPage() {
           }}
           onEnabledChange={(name, newEnabled) => {
             setSelectedTool((prev) => prev ? { ...prev, enabled: newEnabled } : prev);
-            handleRefresh();
+            void refreshToolData();
           }}
         />
       )}
@@ -645,7 +645,10 @@ export default function ToolPage() {
       {/* MCP Sheet */}
       {showMCPSheet && (
         <MCPSheet
-          onClose={() => setShowMCPSheet(false)}
+          onClose={() => {
+            setShowMCPSheet(false);
+            void handleRefresh();
+          }}
           onSaved={() => { setShowMCPSheet(false); handleRefresh(); setMcpRefreshKey(k => k + 1); }}
           onRefresh={handleRefresh}
         />
@@ -654,14 +657,20 @@ export default function ToolPage() {
       {/* API Sheet */}
       {showAPISheet && (
         <APISheet
-          onClose={() => setShowAPISheet(false)}
+          onClose={() => {
+            setShowAPISheet(false);
+            void handleRefresh();
+          }}
         />
       )}
 
       {/* Generate Tool Sheet */}
       {showGenerateSheet && (
         <GenerateToolSheet
-          onClose={() => setShowGenerateSheet(false)}
+          onClose={() => {
+            setShowGenerateSheet(false);
+            void handleRefresh();
+          }}
         />
       )}
 
