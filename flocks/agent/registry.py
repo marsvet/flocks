@@ -139,6 +139,10 @@ def _build_available_agents(agents: Dict[str, AgentInfo]) -> List[AvailableAgent
     return available
 
 
+def _sort_available_agents(agents: List[AvailableAgent]) -> List[AvailableAgent]:
+    return sorted(agents, key=lambda agent: agent.name.lower())
+
+
 def _storage_custom_agent_to_info(agent_data: Dict[str, Any]) -> Optional[AgentInfo]:
     """Convert a Storage-backed custom agent record into AgentInfo."""
     name = agent_data.get("name")
@@ -469,6 +473,11 @@ class Agent:
             return (not is_default, a.name)
 
         return sorted(agents.values(), key=sort_key)
+
+    @classmethod
+    async def list_available_agents(cls) -> List[AvailableAgent]:
+        agents = await cls.state()
+        return _sort_available_agents(_build_available_agents(agents))
 
     @classmethod
     async def default_agent(cls) -> str:
