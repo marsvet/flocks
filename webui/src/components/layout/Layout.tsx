@@ -20,6 +20,7 @@ import {
   Archive,
   ServerCog,
   ScrollText,
+  ShieldCheck,
 } from 'lucide-react';
 import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -40,17 +41,24 @@ const OnboardingModal = lazy(() => import('@/components/common/OnboardingModal')
 const UpdateModal = lazy(() => import('@/components/common/UpdateModal'));
 const NotificationModal = lazy(() => import('@/components/common/NotificationModal'));
 import { checkUpdate, type VersionInfo } from '@/api/update';
+import { consoleUpgradeApi } from '@/api/consoleUpgrade';
 import {
   ackNotification,
   getActiveNotifications,
   getNotificationAckStatus,
   type UserNotification,
 } from '@/api/notifications';
+import { flocksproUsersApi } from '@/api/flocksproUsers';
 import { useAuth } from '@/contexts/AuthContext';
 import { getLocalizedReleaseNotes } from '@/utils/releaseNotes';
 
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000;
 const UPDATE_CHECK_MIN_GAP_MS = 600_000;
+
+function formatProVersion(version?: string | null): string | null {
+  const normalized = (version || '').trim().replace(/^pro-v/i, '').replace(/^v/i, '');
+  return normalized ? `pro-v${normalized}` : null;
+}
 
 function buildUpdateNotification(info: VersionInfo | null, language: string): UserNotification | null {
   const releaseNotes = getLocalizedReleaseNotes(info?.release_notes, language);
@@ -95,6 +103,10 @@ export default function Layout() {
   const [updateNotificationReady, setUpdateNotificationReady] = useState(false);
   const [acknowledgingNotificationIds, setAcknowledgingNotificationIds] = useState<string[]>([]);
   const lastNotificationFetchKeyRef = useRef<string | null>(null);
+  const [hasFlocksproCapability, setHasFlocksproCapability] = useState(false);
+  const [isFlocksproActive, setIsFlocksproActive] = useState(false);
+  const [flocksproStatusReady, setFlocksproStatusReady] = useState(false);
+  const [flocksproVersion, setFlocksproVersion] = useState<string | null>(null);
   // useLayoutEffect runs synchronously before paint, so there's no flash on initial load.
   // It also re-runs when the user navigates back to /, covering both cases in one place.
   useLayoutEffect(() => {
@@ -111,6 +123,15 @@ export default function Layout() {
   }, [handleOpenOnboarding]);
 
   const refreshUpdateStatus = useCallback(async (force = false) => {
+    if (!flocksproStatusReady) return;
+    if (isFlocksproActive) {
+      setUpdateInfo(null);
+      setHasUpdate(false);
+      setLatestVersion(null);
+      setHasCompletedUpdateCheck(true);
+      return;
+    }
+
     const now = Date.now();
     if (checkingUpdateRef.current) return;
     if (!force && now - lastUpdateCheckAtRef.current < UPDATE_CHECK_MIN_GAP_MS) return;
@@ -150,9 +171,11 @@ export default function Layout() {
       checkingUpdateRef.current = false;
       setHasCompletedUpdateCheck(true);
     }
-  }, [i18n.language]);
+  }, [flocksproStatusReady, i18n.language, isFlocksproActive]);
 
   useEffect(() => {
+    if (!flocksproStatusReady) return undefined;
+
     refreshUpdateStatus(true);
 
     const intervalId = window.setInterval(() => {
@@ -179,7 +202,83 @@ export default function Layout() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleWindowFocus);
     };
-  }, [refreshUpdateStatus]);
+  }, [flocksproStatusReady, refreshUpdateStatus]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!user?.id || user.role !== 'admin') {
+      setHasFlocksproCapability(false);
+      setFlocksproVersion(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    const refreshCapability = () => {
+      void flocksproUsersApi.hasCapability()
+        .then((ok) => {
+          if (!cancelled) {
+            setHasFlocksproCapability(ok);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setHasFlocksproCapability(false);
+          }
+        });
+    };
+    refreshCapability();
+    window.addEventListener('flockspro-license-status-changed', refreshCapability);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('flockspro-license-status-changed', refreshCapability);
+    };
+  }, [user?.id, user?.role]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFlocksproStatusReady(false);
+    if (!user?.id || user.role !== 'admin') {
+      setIsFlocksproActive(false);
+      setFlocksproVersion(null);
+      setFlocksproStatusReady(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+    const refreshFlocksproStatus = () => {
+      setFlocksproStatusReady(false);
+      void Promise.all([
+        flocksproUsersApi.getLicenseStatus(),
+        consoleUpgradeApi.getProPackageStatus().catch(() => null),
+      ])
+        .then(([licenseStatus, packageStatus]) => {
+          if (cancelled) return;
+          const active = licenseStatus.pro_enabled === true;
+          setIsFlocksproActive(active);
+          const version = active
+            ? formatProVersion(packageStatus?.flockspro_component_version || packageStatus?.installed_version)
+            : null;
+          setFlocksproVersion(version);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setIsFlocksproActive(false);
+            setFlocksproVersion(null);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setFlocksproStatusReady(true);
+          }
+        });
+    };
+    refreshFlocksproStatus();
+    window.addEventListener('flockspro-license-status-changed', refreshFlocksproStatus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('flockspro-license-status-changed', refreshFlocksproStatus);
+    };
+  }, [user?.id, user?.role]);
 
   useEffect(() => {
     if (!user?.id) {
@@ -333,10 +432,16 @@ export default function Layout() {
         items: [
           { name: t('accountManagement'), href: '/config', icon: UserCog },
           { name: t('systemLog'), href: '/system-logs', icon: ScrollText },
+          ...(hasFlocksproCapability && user?.role === 'admin'
+            ? [{ name: t('auditLogs'), href: '/audit-logs', icon: ShieldCheck }]
+            : []),
+          ...(user?.role === 'admin'
+            ? [{ name: t('flocksproUpgrade'), href: '/flockspro-upgrade', icon: ArrowUpCircle }]
+            : []),
         ],
       },
     ],
-    [t],
+    [hasFlocksproCapability, t, user?.role],
   );
 
   const isFullScreenPage =
@@ -344,6 +449,15 @@ export default function Layout() {
     matchPath('/workflows/:id/edit', location.pathname) ||
     matchPath('/workflows/:id', location.pathname) ||
     matchPath('/sessions', location.pathname);
+  const productName = isFlocksproActive ? 'Flocks Pro' : 'Flocks';
+  const displayVersion = isFlocksproActive
+    ? flocksproVersion || (currentVersion ? `v${currentVersion}` : null)
+    : currentVersion ? `v${currentVersion}` : null;
+  const currentVersionLabel = isFlocksproActive
+    ? t('currentProductVersionLabel', { version: displayVersion || productName })
+    : currentVersion
+    ? t('currentVersionLabel', { version: currentVersion })
+    : productName;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -395,13 +509,13 @@ export default function Layout() {
             {collapsed ? (
               <div
                 className="w-8 h-8 rounded-lg border border-zinc-200 bg-white flex items-center justify-center flex-shrink-0 shadow-sm"
-                title="Flocks"
+                title={productName}
               >
                 <Sparkles className="w-4 h-4 text-zinc-500" />
               </div>
             ) : (
               <>
-                <span className="flex-1 min-w-0 text-xl font-bold text-zinc-900 whitespace-nowrap">Flocks</span>
+                <span className="flex-1 min-w-0 text-xl font-bold text-zinc-900 whitespace-nowrap">{productName}</span>
                 <button
                   onClick={() => setSidebarOpen(false)}
                   className="lg:hidden p-1 text-zinc-400 hover:text-zinc-600 rounded flex-shrink-0"
@@ -474,9 +588,7 @@ export default function Layout() {
                       </span>
                     </div>
                     <div className="mt-1 text-xs text-amber-700">
-                      {currentVersion
-                        ? t('currentVersionLabel', { version: currentVersion })
-                        : 'Flocks'}
+                      {currentVersionLabel}
                     </div>
                     <div className="mt-0.5 text-xs font-medium text-amber-900">
                       AI Native SecOps Platform
@@ -489,7 +601,7 @@ export default function Layout() {
                   >
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs font-medium text-zinc-500 group-hover:text-zinc-800 transition-colors">
-                        Flocks {currentVersion ? `v${currentVersion}` : '...'}
+                        {productName} {displayVersion || '...'}
                       </span>
                     </div>
                     <div className="mt-0.5 text-xs text-zinc-400">AI Native SecOps Platform</div>
