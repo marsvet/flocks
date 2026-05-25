@@ -34,15 +34,44 @@ class _GroupContextEntry:
 
 
 def _parse_slash_command(text: str) -> tuple[Optional[str], str]:
+    """Parse a slash command from inbound text.
+
+    Strict path: text begins with ``/cmd [args]``.
+
+    Channel fallback: group-mention IM messages often arrive with the bot's
+    display name still in the body (e.g. ``"- test /compact"`` on WeCom).
+    In that case we scan for the first ``/<word>`` token and treat it as a
+    command **only when** ``<word>`` resolves against the registry, so plain
+    chatter like ``"see /tmp/foo.log"`` does not get hijacked.
+    """
+    import re
+
+    from flocks.command.command import Command
+
     stripped = text.strip()
-    if not stripped.startswith("/"):
+    if stripped.startswith("/"):
+        parts = stripped[1:].split(None, 1)
+        if not parts:
+            return None, ""
+        name = parts[0].strip().lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
+        return name or None, args
+
+    match = re.search(r"(?:^|\s)/([A-Za-z_][\w-]*)(?:\s+(.*))?$", stripped)
+    if not match:
         return None, ""
-    parts = stripped[1:].split(None, 1)
-    if not parts:
+    candidate = match.group(1).strip().lower()
+    if not candidate:
         return None, ""
-    name = parts[0].strip().lower()
-    args = parts[1].strip() if len(parts) > 1 else ""
-    return name or None, args
+    if Command.resolve(candidate) is None:
+        return None, ""
+    args = (match.group(2) or "").strip()
+    log.info("dispatcher.slash_command.fallback_matched", {
+        "raw_text_preview": stripped[:80],
+        "command": candidate,
+        "has_args": bool(args),
+    })
+    return candidate, args
 
 
 # =====================================================================
@@ -605,6 +634,16 @@ class InboundDispatcher:
         if command_def is None:
             return False
 
+        # Normalise the event text into the canonical "/cmd args" form so the
+        # downstream ``dispatch_user_input`` (which re-parses ``event.text``
+        # with the strict slash parser) does not reject group-mention bodies
+        # like ``"- test /compact"``.
+        normalised_text = (
+            f"/{command_def.name} {command_args}".strip()
+            if command_args
+            else f"/{command_def.name}"
+        )
+
         callbacks = self._build_callbacks(binding, msg)
 
         async def _publish_direct_response(_event, text: str) -> None:
@@ -642,14 +681,15 @@ class InboundDispatcher:
         event = UserInputEvent(
             source_type=msg.channel_id if msg.channel_id in {"feishu", "wecom", "telegram"} else "channel",
             sessionID=binding.session_id,
-            text=user_text,
-            parts=[{"type": "text", "text": user_text}],
+            text=normalised_text,
+            parts=[{"type": "text", "text": normalised_text}],
             agent=binding.agent_id,
             display_text=user_text,
             working_directory=channel_config.workspace_dir,
             metadata={
                 "channel_id": msg.channel_id,
                 "chat_id": msg.chat_id or msg.sender_id,
+                "original_text": user_text,
             },
         )
         await dispatch_user_input(
