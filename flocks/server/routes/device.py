@@ -272,7 +272,10 @@ async def route_test_device(device_id: str, body: Optional[DeviceTestRequest] = 
                 base_url = f"https://{host}:{port}" if port else f"https://{host}"
 
     if not base_url:
-        return DeviceTestResult(success=False, message="未配置设备地址（base_url），请先填写")
+        return DeviceTestResult(
+            success=False,
+            message="未配置设备地址（base_url 或 host），请先填写",
+        )
 
     if body is not None and body.verify_ssl is not None:
         verify_ssl = bool(body.verify_ssl)
