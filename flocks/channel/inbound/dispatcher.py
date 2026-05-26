@@ -924,6 +924,11 @@ class InboundDispatcher:
             )
             if result == "stop":
                 await callbacks.deliver_text("上下文压缩失败，请稍后重试。")
+            elif result == "skipped":
+                await callbacks.deliver_text(
+                    "本轮上下文压缩已被跳过（系统处于冷却期或上一轮节省过小），"
+                    "稍后会自动重试。"
+                )
             else:
                 focus_note = f"（聚焦：{focus_instruction}）" if focus_instruction else ""
                 await callbacks.deliver_text(f"上下文压缩完成{focus_note}，历史已归档为摘要。")

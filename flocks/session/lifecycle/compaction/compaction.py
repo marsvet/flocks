@@ -931,7 +931,7 @@ class SessionCompaction:
         policy: Optional[CompactionPolicy] = None,
         focus_instruction: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
-    ) -> Literal["continue", "stop"]:
+    ) -> Literal["continue", "stop", "skipped"]:
         """Process compaction by generating a summary message.
 
         Creates an assistant message with a summary of the conversation

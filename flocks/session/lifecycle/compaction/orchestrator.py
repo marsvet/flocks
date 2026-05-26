@@ -70,8 +70,17 @@ async def run_compaction(
     status_after: StatusAfter = "idle",
     focus_instruction: Optional[str] = None,
     progress_callback: Optional[ProgressCallback] = None,
-) -> Literal["continue", "stop"]:
+) -> Literal["continue", "stop", "skipped"]:
     """Run compaction with shared status transitions and event publishing.
+
+    Return values:
+      ``"continue"`` — compaction completed; summary/archive were written.
+      ``"stop"``     — compaction failed in a way that should abort the
+                       caller's outer loop (provider unavailable, etc.).
+      ``"skipped"``  — anti-thrashing or summary-provider cooldown fired;
+                       no summary was written and the caller MUST NOT treat
+                       this as success (no cooldown-step update, no
+                       ``context.compacted`` event).
 
     ``focus_instruction`` is an optional free-form user directive (used
     by manual ``/compact <focus>`` invocations) forwarded verbatim to
