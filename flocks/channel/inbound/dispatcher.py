@@ -65,6 +65,25 @@ def _parse_slash_command(text: str) -> tuple[Optional[str], str]:
         return None, ""
     if Command.resolve(candidate) is None:
         return None, ""
+
+    # Guard: the text BEFORE the slash must look like a bot-mention prefix,
+    # not natural-language content.  Group-IM platforms (WeCom, Feishu) inject
+    # a short "- BotName" or "@BotName" prefix before the command; anything
+    # else (e.g. "请解释一下 /help" or "prefix /new thanks") is a sentence
+    # that happens to contain a slash word and must NOT be hijacked.
+    #
+    # Accepted:  "- rex"  "@flocks_bot"  ""  (empty = leading slash already
+    #            handled by the strict path above)
+    # Rejected:  "请解释一下"  "prefix"  "I want to know about"
+    pre_slash = stripped[: match.start()].rstrip()
+    if pre_slash and not re.match(r"^[-@]\s*\w+\s*$", pre_slash):
+        log.debug("dispatcher.slash_command.fallback_rejected", {
+            "raw_text_preview": stripped[:80],
+            "pre_slash": pre_slash[:40],
+            "candidate": candidate,
+        })
+        return None, ""
+
     args = (match.group(2) or "").strip()
     log.info("dispatcher.slash_command.fallback_matched", {
         "raw_text_preview": stripped[:80],

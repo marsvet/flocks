@@ -969,7 +969,7 @@ class SessionCompaction:
                 "last_savings_ratio": history.last_savings_ratio,
                 "total_skipped": history.total_skipped,
             })
-            return "continue"
+            return "skipped"
 
         log.info("compaction.process.start", {
             "session_id": session_id,
@@ -1232,10 +1232,10 @@ class SessionCompaction:
                 await _emit_progress(progress_callback, "complete", {
                     "result": "skipped_no_summary",
                 })
-                # Returning "continue" keeps the session alive; the caller
-                # decides whether to retry (auto path) or surface an error
-                # (overflow attempts exhausted in session_loop).
-                return "continue"
+                # Returning "skipped" keeps the session alive without marking
+                # the round as a successful compaction — the caller must NOT
+                # update last_compaction_step or publish context.compacted.
+                return "skipped"
 
             # E1: persist this summary for the NEXT compaction round so we
             # can switch the prompt to "merge new turns into prior summary".

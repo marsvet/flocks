@@ -276,10 +276,16 @@ class ToolOutputConfig(BaseModel):
 
     Defaults mirror the hard-coded constants that were previously spread
     across ``flocks/tool/file/read.py`` and ``flocks/tool/truncation.py``.
+
+    Both camelCase (``readMaxLines``) and snake_case (``read_max_lines``)
+    keys are accepted in ``flocks.json``.
     """
+
+    model_config = {"populate_by_name": True}
 
     read_max_lines: Optional[int] = Field(
         None,
+        alias="readMaxLines",
         gt=0,
         description=(
             "Max lines returned by the read tool per call (default 2000). "
@@ -288,6 +294,7 @@ class ToolOutputConfig(BaseModel):
     )
     read_max_bytes: Optional[int] = Field(
         None,
+        alias="readMaxBytes",
         gt=0,
         description=(
             "Byte cap for a single read tool call (default 51200 = 50 KB). "
@@ -296,6 +303,7 @@ class ToolOutputConfig(BaseModel):
     )
     read_max_line_length: Optional[int] = Field(
         None,
+        alias="readMaxLineLength",
         gt=0,
         description=(
             "Characters per line before the remainder is replaced with '...' "

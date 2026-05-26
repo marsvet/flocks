@@ -788,8 +788,14 @@ class SessionLoop:
                             if callbacks.on_error:
                                 await callbacks.on_error("Compaction failed")
                             break
-                        
-                        # Continue after compaction
+
+                        if compaction_result == "skipped":
+                            log.info("loop.manual_compaction_skipped", {
+                                "session_id": ctx.session.id,
+                                "step": ctx.step,
+                            })
+
+                        # Continue after compaction (whether compacted or skipped)
                         continue
                         
                     except Exception as e:
@@ -1132,26 +1138,39 @@ class SessionLoop:
                                 policy=compaction_policy,
                                 progress_callback=progress_callback_overflow,
                             )
-                            ctx.last_compaction_step = ctx.step
-                            set_context_state(
-                                ctx.session.id,
-                                compaction_performed=True,
-                                last_compaction_step=ctx.step,
-                                last_compaction_reason="full_compaction",
-                            )
-                            await cls._publish_runtime_event(callbacks, "context.compacted", {
-                                "sessionID": ctx.session.id,
-                                "step": ctx.step,
-                                "reason": "full_compaction",
-                                "attempt": ctx.overflow_compaction_attempts,
-                                "cooldownUntilStep": ctx.step + POST_COMPACTION_COOLDOWN_STEPS,
-                            })
-                            
+
                             if compaction_result == "stop":
                                 log.error("loop.compaction_failed", {"session_id": ctx.session.id})
                                 if callbacks.on_error:
                                     await callbacks.on_error("Compaction failed")
                                 break
+
+                            if compaction_result == "skipped":
+                                # Anti-thrashing cooldown or summary-provider
+                                # cooldown fired — nothing was archived, do NOT
+                                # update last_compaction_step or publish the
+                                # compacted event (would mislead cooldown logic
+                                # and UI into thinking compaction succeeded).
+                                log.info("loop.compaction_skipped", {
+                                    "session_id": ctx.session.id,
+                                    "step": ctx.step,
+                                })
+                            else:
+                                # compaction_result == "continue": real success
+                                ctx.last_compaction_step = ctx.step
+                                set_context_state(
+                                    ctx.session.id,
+                                    compaction_performed=True,
+                                    last_compaction_step=ctx.step,
+                                    last_compaction_reason="full_compaction",
+                                )
+                                await cls._publish_runtime_event(callbacks, "context.compacted", {
+                                    "sessionID": ctx.session.id,
+                                    "step": ctx.step,
+                                    "reason": "full_compaction",
+                                    "attempt": ctx.overflow_compaction_attempts,
+                                    "cooldownUntilStep": ctx.step + POST_COMPACTION_COOLDOWN_STEPS,
+                                })
                             
                             # Continuation user message is now created inside
                             # SessionCompaction.process() (matching Flocks).
