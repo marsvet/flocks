@@ -481,16 +481,24 @@ async def update_mcp_server(name: str, request: McpUpdateRequest):
             previous_status is not None
             and previous_status.status == McpStatus.CONNECTED
         )
-        # Reconnect when:
-        # 1. Server was already connected (config change) OR
-        # 2. Server is being enabled for the first time (was disabled/absent)
-        #    and there is no credential/config blocker.
-        # In both cases the new config must have enabled != False.
+        # Reconnect whenever the user just saved a config that asks the
+        # server to be enabled AND the config is complete enough to try.
+        # This covers three real flows:
+        #
+        #   * config change while already connected — pre-existing case;
+        #   * first enable from a previously-disabled/never-seen server —
+        #     the runtime ``status`` dict is empty for that name;
+        #   * fixing credentials after a failed connect — runtime state
+        #     was FAILED/DISCONNECTED and the user just saved the corrected
+        #     config; they expect a re-try without an extra click.
+        #
+        # ``get_connect_block_reason`` short-circuits when the config is
+        # still incomplete (e.g. ``{secret:...}`` placeholder with no value
+        # in the secret store) so we never spin up doomed connect attempts.
         becoming_enabled = clean_config.get("enabled", True) is not False
-        was_previously_active = previous_status is not None
-        should_reconnect = becoming_enabled and (
-            was_connected
-            or (not was_previously_active and not get_connect_block_reason(clean_config))
+        should_reconnect = (
+            becoming_enabled
+            and not get_connect_block_reason(clean_config)
         )
 
         if previous_status is not None:
