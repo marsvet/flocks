@@ -17,7 +17,7 @@
  */
 
 import { useState, useCallback, useRef, useEffect, useMemo, memo } from 'react';
-import { Send, Loader2, ChevronDown, Square, Copy, User, FileText, AlertCircle, X, RefreshCw, Pencil, Save, ImageIcon, Paperclip, ArrowUp, Clock, CheckCircle2, XCircle, Brain } from 'lucide-react';
+import { Send, Loader2, ChevronDown, Square, Copy, User, FileText, AlertCircle, X, RefreshCw, Pencil, Save, ImageIcon, Paperclip, ArrowUp, Clock, CheckCircle2, XCircle, Brain, Bot } from 'lucide-react';
 import { StreamingMarkdown } from './StreamingMarkdown';
 import { useTranslation } from 'react-i18next';
 import LoadingSpinner from './LoadingSpinner';
@@ -32,9 +32,11 @@ import { usePendingQuestions, type PendingQuestion } from '@/hooks/usePendingQue
 import { sessionApi } from '@/api/session';
 import client, { getApiBase } from '@/api/client';
 import { commandAPI, type Command } from '@/api/skill';
+import type { Agent } from '@/api/agent';
 import { useToast } from './Toast';
 import { workspaceAPI } from '@/api/workspace';
 import { formatSmartTime } from '@/utils/time';
+import { getAgentDisplayDescription } from '@/utils/agentDisplay';
 import {
   FILE_INPUT_ACCEPT_IMAGES,
   batchCompressOptions,
@@ -105,6 +107,8 @@ export interface SessionChatProps {
   onInitialMessageConsumed?: () => void;
   /** Agent name to include in prompt_async requests */
   agentName?: string;
+  /** Agents available for one-turn @mention routing. */
+  mentionAgents?: Agent[];
   /** Display configuration (compact, showActions, showTimestamp) */
   display?: SessionChatDisplay;
   /** Custom welcome content when no messages. Can be a render prop receiving setInput. */
@@ -130,7 +134,7 @@ export interface SessionChatProps {
    * session id) directly without an empty ``async (..) => { await ... }``
    * shim.
    */
-  onCreateAndSend?: (text: string, imageParts?: ImagePartData[]) => Promise<unknown> | unknown;
+  onCreateAndSend?: (text: string, imageParts?: ImagePartData[], agentOverride?: string) => Promise<unknown> | unknown;
   /** Called when the user sends "/new" to create a new session */
   onCreateNewSession?: () => Promise<void> | void;
   /**
@@ -385,6 +389,35 @@ function isAllowedUploadFile(file: File): boolean {
   return ALLOWED_UPLOAD_EXTENSIONS.has(getFileExtension(file.name));
 }
 
+function formatAgentName(name: string): string {
+  return name ? name.charAt(0).toUpperCase() + name.slice(1) : name;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function findMentionTrigger(text: string, cursor: number): { start: number; end: number; query: string } | null {
+  const beforeCursor = text.slice(0, cursor);
+  const match = beforeCursor.match(/(^|\s)@([^\s@]*)$/);
+  if (!match) return null;
+  const query = match[2] ?? '';
+  return {
+    start: beforeCursor.length - query.length - 1,
+    end: cursor,
+    query,
+  };
+}
+
+function resolveMentionAgentName(text: string, agents: Agent[]): string | null {
+  const sorted = [...agents].sort((a, b) => b.name.length - a.name.length);
+  for (const agent of sorted) {
+    const pattern = new RegExp(`(^|\\s)@${escapeRegExp(agent.name)}(?=$|\\s|[,.!?;:，。！？；：])`, 'i');
+    if (pattern.test(text)) return agent.name;
+  }
+  return null;
+}
+
 function isUploadedDocumentAttachment<T extends {
   status: string;
   workspacePath?: string;
@@ -444,8 +477,9 @@ export default function SessionChat({
   onInitialMessageConsumed,
   supportsVision,
   toolbarSlot,
+  mentionAgents = [],
 }: SessionChatProps) {
-  const { t } = useTranslation('session');
+  const { t, i18n } = useTranslation('session');
   const toast = useToast();
   const compact = display?.compact ?? true;
   const showActions = display?.showActions ?? false;
@@ -555,6 +589,10 @@ export default function SessionChat({
   const [commandQuery, setCommandQuery] = useState('');
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0);
   const commandsLoadedRef = useRef(false);
+  const [mentionQuery, setMentionQuery] = useState('');
+  const [mentionRange, setMentionRange] = useState<{ start: number; end: number } | null>(null);
+  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
+  const [pendingAgentName, setPendingAgentName] = useState(agentName || 'rex');
   const successfulDocAttachments = useMemo(
     () => attachments.filter((a) => a.status === 'success' && a.workspacePath && !a.isImage),
     [attachments],
@@ -571,6 +609,12 @@ export default function SessionChat({
   const hasUploadingFiles = attachments.some((attachment) => attachment.status === 'uploading');
   const canSend = !sending && !isStreaming && !hasUploadingFiles &&
     (!!input.trim() || successfulDocAttachments.length > 0 || successfulImageAttachments.length > 0);
+  const filteredMentionAgents = useMemo(() => {
+    const q = mentionQuery.trim().toLowerCase();
+    return mentionAgents
+      .filter((agent) => !q || agent.name.toLowerCase().startsWith(q))
+      .slice(0, 12);
+  }, [mentionAgents, mentionQuery]);
 
   const scrollToBottom = useCallback(() => {
     if (!isAtBottomRef.current) return;
@@ -785,6 +829,12 @@ export default function SessionChat({
   }, [compact]);
   useEffect(() => { autoResize(); }, [input, autoResize]);
 
+  useEffect(() => {
+    if (!sending && !isStreaming) {
+      setPendingAgentName(agentName || 'rex');
+    }
+  }, [agentName, sending, isStreaming]);
+
   // Reset state on session change
   useEffect(() => {
     setIsStreaming(false);
@@ -793,6 +843,10 @@ export default function SessionChat({
     setIsCompacting(false);
     setCompactingMessage('');
     setCompactionStages([]);
+    setMentionRange(null);
+    setMentionQuery('');
+    setSelectedMentionIndex(0);
+    setPendingAgentName(agentName || 'rex');
     abortingRef.current = false;
     abortedMessageIdRef.current = null;
     statusCheckedRef.current = null;
@@ -1171,14 +1225,16 @@ export default function SessionChat({
   };
 
   /** Core send logic */
-  const sendText = async (text: string, imageParts: ImagePartData[] = []) => {
+  const sendText = async (text: string, imageParts: ImagePartData[] = [], agentOverride?: string) => {
     if (!sessionId) return;
+    const effectiveAgent = agentOverride || agentName;
     // Clear abort state immediately so SSE events for the new stream are not suppressed
     abortingRef.current = false;
     // Force scroll to bottom when user sends a new message
     isAtBottomRef.current = true;
     setSending(true);
     setIsStreaming(true);
+    setPendingAgentName(effectiveAgent || 'rex');
 
     const tempId = `temp-${Date.now()}`;
     const tempParts: MessagePart[] = [];
@@ -1193,13 +1249,14 @@ export default function SessionChat({
       role: 'user',
       parts: tempParts.length > 0 ? tempParts : [{ id: `${tempId}-part`, type: 'text', text }],
       timestamp: Date.now(),
+      agent: effectiveAgent,
     } as Message);
 
     try {
       const payload: Record<string, unknown> = {
         parts: buildPromptParts(text, imageParts),
       };
-      if (agentName) payload.agent = agentName;
+      if (effectiveAgent) payload.agent = effectiveAgent;
 
       await client.post(`/api/session/${sessionId}/prompt_async`, payload);
     } catch (err: unknown) {
@@ -1222,12 +1279,14 @@ export default function SessionChat({
     const docAttachmentsToSend = [...successfulDocAttachments];
     const imageAttachmentsToSend = [...successfulImageAttachments];
     const text = buildMessageText(rawText, docAttachmentsToSend);
+    const mentionedAgent = resolveMentionAgentName(rawText, mentionAgents);
 
     // Need either text content or image attachments
     if (!text && imageAttachmentsToSend.length === 0) return;
 
     setInput('');
     setShowCommandDropdown(false);
+    setMentionRange(null);
 
     const imageParts: ImagePartData[] = imageAttachmentsToSend.map((a) => ({
       url: a.dataUrl!,
@@ -1264,7 +1323,8 @@ export default function SessionChat({
       if (onCreateAndSend) {
         setSending(true);
         try {
-          await onCreateAndSend(text, imageParts);
+          setPendingAgentName(mentionedAgent || 'rex');
+          await onCreateAndSend(text, imageParts, mentionedAgent || undefined);
           setAttachments([]);
         } catch {
           // Restore both the text and the attachment list so the user can
@@ -1280,7 +1340,7 @@ export default function SessionChat({
     }
 
     try {
-      await sendText(text, imageParts);
+      await sendText(text, imageParts, mentionedAgent || undefined);
       setAttachments([]);
     } catch {
       setInput(rawText);
@@ -1300,7 +1360,57 @@ export default function SessionChat({
     onInitialMessageConsumed?.();
   }, [initialMessage, sessionId]);
 
+  const insertMention = useCallback((name: string) => {
+    const currentValue = textareaRef.current?.value ?? input;
+    const cursorPos = textareaRef.current?.selectionStart ?? currentValue.length;
+    const currentRange = findMentionTrigger(currentValue, cursorPos) ?? mentionRange;
+    if (!currentRange) return;
+    const next = `${currentValue.slice(0, currentRange.start)}@${name} ${currentValue.slice(currentRange.end)}`;
+    const cursor = currentRange.start + name.length + 2;
+    setInput(next);
+    setMentionRange(null);
+    setMentionQuery('');
+    setSelectedMentionIndex(0);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(cursor, cursor);
+    });
+  }, [input, mentionRange]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    const currentValue = e.currentTarget instanceof HTMLTextAreaElement ? e.currentTarget.value : input;
+    const activeMention = mentionRange
+      ? findMentionTrigger(currentValue, textareaRef.current?.selectionStart ?? currentValue.length)
+      : null;
+    if (mentionRange && !activeMention) {
+      setMentionRange(null);
+    }
+    if (activeMention && filteredMentionAgents.length > 0) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setMentionRange(null);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedMentionIndex((i) => (i - 1 + filteredMentionAgents.length) % filteredMentionAgents.length);
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedMentionIndex((i) => (i + 1) % filteredMentionAgents.length);
+        return;
+      }
+      if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !isComposingRef.current)) {
+        e.preventDefault();
+        const chosen = filteredMentionAgents[selectedMentionIndex] ?? filteredMentionAgents[0];
+        if (chosen) {
+          insertMention(chosen.name);
+        }
+        return;
+      }
+    }
+
     if (showCommandDropdown) {
       const filtered = commands.filter(
         (cmd) => !cmd.hidden && (commandQuery === '' || cmd.name.toLowerCase().startsWith(commandQuery.toLowerCase()))
@@ -1654,11 +1764,11 @@ export default function SessionChat({
                       compact ? 'w-7 h-7 text-xs' : 'w-8 h-8 text-sm'
                     }`}
                   >
-                    R
+                    {formatAgentName(pendingAgentName).charAt(0).toUpperCase()}
                   </span>
                   <div className="flex flex-col items-start flex-1 min-w-0">
                     <div className={`flex items-center gap-2 ${compact ? 'h-7' : 'h-8'}`}>
-                      <span className="text-xs font-semibold text-zinc-700">Rex</span>
+                      <span className="text-xs font-semibold text-zinc-700">{formatAgentName(pendingAgentName)}</span>
                     </div>
                     <div className="flex flex-col min-w-0 w-full">
                       <div className={`${compact ? 'max-w-[90%] px-4 py-3 rounded-[20px]' : 'w-full px-5 py-4 rounded-[24px]'} text-sm break-words shadow-sm bg-amber-50 border border-amber-200`}>
@@ -1712,11 +1822,11 @@ export default function SessionChat({
                       compact ? 'w-7 h-7 text-xs' : 'w-8 h-8 text-sm'
                     }`}
                   >
-                    R
+                    {formatAgentName(pendingAgentName).charAt(0).toUpperCase()}
                   </span>
                   <div className="flex flex-col items-start flex-1 min-w-0">
                     <div className={`flex items-center gap-2 ${compact ? 'h-7' : 'h-8'}`}>
-                      <span className="text-xs font-semibold text-zinc-700">Rex</span>
+                      <span className="text-xs font-semibold text-zinc-700">{formatAgentName(pendingAgentName)}</span>
                     </div>
                     <div className="flex flex-col min-w-0 w-full">
                       <div className={getStandaloneThinkingBubbleClassName(compact)}>
@@ -1784,6 +1894,13 @@ export default function SessionChat({
                 setShowCommandDropdown(false);
                 textareaRef.current?.focus();
               }}
+            />
+            <AgentMentionDropdown
+              visible={Boolean(mentionRange) && filteredMentionAgents.length > 0}
+              agents={filteredMentionAgents}
+              selectedIndex={selectedMentionIndex}
+              displayLang={i18n.language}
+              onSelect={(agent) => insertMention(agent.name)}
             />
             <div
               onDragOver={handleComposerDragOver}
@@ -1925,18 +2042,27 @@ export default function SessionChat({
                     onChange={(e) => {
                       const val = e.target.value;
                       setInput(val);
+                      const cursor = e.target.selectionStart ?? val.length;
+                      const mention = mentionAgents.length > 0 ? findMentionTrigger(val, cursor) : null;
                       const trimmed = val.trimStart();
-                      if (trimmed.startsWith('/') && !trimmed.includes(' ') && successfulAttachments.length === 0) {
+                      if (mention && !trimmed.startsWith('/')) {
+                        setMentionRange({ start: mention.start, end: mention.end });
+                        setMentionQuery(mention.query);
+                        setSelectedMentionIndex(0);
+                        setShowCommandDropdown(false);
+                      } else if (trimmed.startsWith('/') && !trimmed.includes(' ') && successfulAttachments.length === 0) {
                         void loadCommandsIfNeeded();
                         const q = trimmed.slice(1);
                         setCommandQuery(q);
                         setSelectedCommandIndex(0);
                         setShowCommandDropdown(true);
+                        setMentionRange(null);
                       } else {
                         setShowCommandDropdown(false);
+                        setMentionRange(null);
                       }
                     }}
-                    onBlur={() => { setTimeout(() => setShowCommandDropdown(false), 100); }}
+                    onBlur={() => { setTimeout(() => { setShowCommandDropdown(false); setMentionRange(null); }, 100); }}
                     onCompositionStart={() => { isComposingRef.current = true; }}
                     onCompositionEnd={() => { isComposingRef.current = false; }}
                     onPaste={handleComposerPaste}
@@ -2015,6 +2141,65 @@ export default function SessionChat({
           onClose={() => setComposerPreview(null)}
         />
       )}
+    </div>
+  );
+}
+
+function AgentMentionDropdown({
+  visible,
+  agents,
+  selectedIndex,
+  displayLang,
+  onSelect,
+}: {
+  visible: boolean;
+  agents: Agent[];
+  selectedIndex: number;
+  displayLang: string;
+  onSelect: (agent: Agent) => void;
+}) {
+  const { t } = useTranslation('session');
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const item = listRef.current?.children[selectedIndex] as HTMLElement | undefined;
+    item?.scrollIntoView({ block: 'nearest' });
+  }, [selectedIndex]);
+
+  if (!visible) return null;
+
+  return (
+    <div
+      className="absolute bottom-full left-0 right-0 mb-1 z-50 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg"
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      <div className="border-b border-gray-100 bg-gray-50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+        {t('chat.mention.title')}
+      </div>
+      <div ref={listRef} className="max-h-64 overflow-y-auto p-1">
+        {agents.map((agent, idx) => {
+          const desc = getAgentDisplayDescription(agent, displayLang) || t('smartAssistant');
+          return (
+            <button
+              key={agent.name}
+              type="button"
+              onClick={() => onSelect(agent)}
+              onMouseDown={(e) => e.preventDefault()}
+              className={`flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
+                idx === selectedIndex ? 'bg-sky-50 text-sky-800' : 'text-gray-800 hover:bg-gray-50'
+              }`}
+            >
+              <Bot className="h-3.5 w-3.5 shrink-0 text-gray-400" />
+              <span className="shrink-0 font-mono text-sm font-semibold">@{agent.name}</span>
+              <span className="min-w-0 truncate text-xs text-gray-500">{desc}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="flex gap-3 border-t border-gray-100 bg-gray-50 px-3 py-1 text-[10px] text-gray-400">
+        <span><kbd className="font-mono">↑↓</kbd> {t('chat.mention.navigate')}</span>
+        <span><kbd className="font-mono">Enter</kbd>/<kbd className="font-mono">Tab</kbd> {t('chat.mention.select')}</span>
+      </div>
     </div>
   );
 }

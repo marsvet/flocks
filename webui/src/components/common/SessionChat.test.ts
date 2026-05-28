@@ -1,5 +1,6 @@
 import React from 'react';
-import { render, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Message } from '@/types';
@@ -30,6 +31,10 @@ const tMock = (key: string) => ({
   'chat.thinking': '思考中...',
   'chat.streaming': '继续输出中...',
   'chat.compacting': '压缩中...',
+  'chat.mention.title': '选择 Agent',
+  'chat.mention.navigate': '导航',
+  'chat.mention.select': '选择',
+  'smartAssistant': '智能助手',
 }[key] ?? key);
 const pendingQuestionsHookMock = {
   pendingQuestions: {},
@@ -49,6 +54,7 @@ const toastMock = {
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: tMock,
+    i18n: { language: 'zh-CN' },
   }),
 }));
 
@@ -87,6 +93,7 @@ vi.mock('@/api/client', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   Object.defineProperty(window.HTMLElement.prototype, 'scrollIntoView', {
     configurable: true,
     value: vi.fn(),
@@ -300,6 +307,66 @@ describe('SessionChat standalone thinking indicator', () => {
     await waitFor(() => {
       expect(container.querySelectorAll('.animate-bounce').length).toBeGreaterThanOrEqual(3);
       expect(container.textContent).not.toContain('思考中...');
+    });
+  });
+});
+
+describe('SessionChat agent mentions', () => {
+  const mentionAgents = [
+    {
+      name: 'rex',
+      description: 'Main orchestrator',
+      descriptionCn: '主编排 Agent',
+      mode: 'primary',
+      permission: [],
+      options: {},
+      skills: [],
+      tools: [],
+    },
+    {
+      name: 'explore',
+      description: 'Explore the codebase',
+      descriptionCn: '探索代码库',
+      mode: 'subagent',
+      native: true,
+      permission: [],
+      options: {},
+      skills: [],
+      tools: [],
+    },
+  ];
+
+  it('shows matching agents when typing @', async () => {
+    const user = userEvent.setup();
+    render(React.createElement(SessionChat, {
+      sessionId: 'sess-1',
+      mentionAgents,
+    }));
+
+    await user.type(screen.getByPlaceholderText('请输入消息'), '@ex');
+
+    expect(screen.getByText('@explore')).toBeInTheDocument();
+    expect(screen.getByText('探索代码库')).toBeInTheDocument();
+  });
+
+  it('routes one message to the mentioned agent without changing the default agent', async () => {
+    const user = userEvent.setup();
+    render(React.createElement(SessionChat, {
+      sessionId: 'sess-1',
+      agentName: 'rex',
+      mentionAgents,
+    }));
+
+    await user.type(screen.getByPlaceholderText('请输入消息'), '@explore summarize this file{enter}');
+
+    await waitFor(() => {
+      expect(clientPostMock).toHaveBeenCalledWith(
+        '/api/session/sess-1/prompt_async',
+        expect.objectContaining({
+          agent: 'explore',
+          parts: expect.any(Array),
+        }),
+      );
     });
   });
 });
