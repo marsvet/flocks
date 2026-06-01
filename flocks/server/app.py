@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import os
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -23,6 +24,7 @@ from flocks.config.config import Config
 from flocks.storage.storage import Storage
 from flocks.utils.langfuse import initialize as init_observability, shutdown as shutdown_observability
 from flocks.auth.service import AuthService
+from flocks.extensions import ExtensionOptions, handler_name, normalize_fail_policy, normalize_timeout
 from flocks.server.auth import apply_auth_for_request, clear_auth_context
 
 # Load .env file at startup
@@ -550,6 +552,60 @@ app = FastAPI(
 log = Log.create(service="server")
 
 
+@dataclass
+class _HTTPMiddlewareHook:
+    hook: Callable[..., Any]
+    options: ExtensionOptions
+
+
+_http_middleware_hooks: list[_HTTPMiddlewareHook] = []
+
+
+def register_http_middleware(
+    hook: Callable[..., Any],
+    *,
+    name: Optional[str] = None,
+    priority: int = 100,
+    timeout_seconds: Optional[float] = None,
+    fail_policy: Any = None,
+    critical: bool = False,
+) -> None:
+    """Register an extension hook that can inspect HTTP requests."""
+    options = ExtensionOptions(
+        name=handler_name(hook, name),
+        priority=priority,
+        timeout_seconds=normalize_timeout(timeout_seconds),
+        fail_policy=normalize_fail_policy(fail_policy, critical=critical),
+    )
+    registration = _HTTPMiddlewareHook(hook=hook, options=options)
+
+    _http_middleware_hooks[:] = [
+        existing for existing in _http_middleware_hooks
+        if existing.options.name != options.name
+    ]
+    _http_middleware_hooks.append(registration)
+    _http_middleware_hooks.sort(key=lambda item: (item.options.priority, item.options.name))
+
+
+async def _run_http_middleware_hooks(request: Request, context: dict[str, Any]) -> None:
+    for registration in list(_http_middleware_hooks):
+        try:
+            result = registration.hook(request, context)
+            if registration.options.timeout_seconds is not None:
+                await asyncio.wait_for(_maybe_await(result), timeout=registration.options.timeout_seconds)
+            else:
+                await _maybe_await(result)
+        except Exception as exc:
+            log.warning("http.middleware_hook.failed", {
+                "name": registration.options.name,
+                "stage": context.get("stage"),
+                "fail_policy": registration.options.fail_policy.value,
+                "error": repr(exc),
+            })
+            if registration.options.critical:
+                raise
+
+
 _REQUEST_LOG_SKIP_EXACT = frozenset({
     "/health",
     "/api/health",
@@ -769,6 +825,7 @@ async def log_requests(request: Request, call_next):
 async def auth_guard_middleware(request: Request, call_next):
     """Guard requests with local account auth, except public endpoints."""
     try:
+        await _run_http_middleware_hooks(request, {"stage": "before_auth"})
         _blocked, token, _user = await apply_auth_for_request(request)
     except StarletteHTTPException as exc:
         return JSONResponse(
