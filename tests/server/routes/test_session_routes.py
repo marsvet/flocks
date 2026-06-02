@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -798,6 +799,90 @@ class TestSessionUtilities:
         assert clear_resp.status_code == status.HTTP_200_OK
 
         # Messages should be gone
+        list_resp = await client.get(f"/api/session/{session_id}/message")
+        assert list_resp.json() == []
+
+    @pytest.mark.asyncio
+    async def test_clear_session_clears_prompt_queue(self, client: AsyncClient, session_id: str):
+        """POST /api/session/{id}/clear also drops queued prompts."""
+        from flocks.session.interaction_queue import InteractionQueue
+
+        await InteractionQueue.clear(session_id)
+        await InteractionQueue.enqueue(
+            session_id,
+            parts=[{"type": "text", "text": "queued after current reply"}],
+        )
+
+        clear_resp = await client.post(f"/api/session/{session_id}/clear")
+
+        assert clear_resp.status_code == status.HTTP_200_OK
+        assert await InteractionQueue.list(session_id) == []
+
+    @pytest.mark.asyncio
+    async def test_clear_session_waits_for_idle_before_clearing_messages(self, monkeypatch):
+        """History is cleared only after abort drains the active session loop."""
+        from flocks.server.routes import session as session_routes
+        from flocks.session.interaction_queue import InteractionQueue
+
+        session_id = "ses_clear_waits_for_idle"
+        await InteractionQueue.clear(session_id)
+        await InteractionQueue.enqueue(
+            session_id,
+            parts=[{"type": "text", "text": "queued prompt"}],
+        )
+        order: list[str] = []
+
+        async def fake_abort_session(_session_id: str) -> bool:
+            order.append("abort")
+            return True
+
+        async def fake_wait_for_session_idle(_session_id: str) -> None:
+            order.append("wait")
+            assert await InteractionQueue.list(session_id) == []
+
+        async def fake_message_clear(_session_id: str) -> int:
+            order.append("message_clear")
+            return 2
+
+        async def fake_publish_event(_event: str, _payload: dict) -> None:
+            return None
+
+        monkeypatch.setattr(
+            session_routes.Session,
+            "get_by_id",
+            AsyncMock(return_value=SimpleNamespace(id=session_id, directory="/tmp/project")),
+        )
+        monkeypatch.setattr(session_routes, "abort_session", fake_abort_session)
+        monkeypatch.setattr(session_routes, "_wait_for_session_idle", fake_wait_for_session_idle)
+        monkeypatch.setattr("flocks.session.message.Message.clear", fake_message_clear)
+        monkeypatch.setattr("flocks.server.routes.event.publish_event", fake_publish_event)
+
+        deleted = await session_routes._clear_session_history(session_id)
+
+        assert deleted == 2
+        assert order == ["abort", "wait", "message_clear"]
+        assert await InteractionQueue.list(session_id) == []
+
+    @pytest.mark.asyncio
+    async def test_clear_command_removes_messages(self, client: AsyncClient, session_id: str):
+        """Command route /clear removes messages via the dispatcher task."""
+        from flocks.server.routes import session as session_routes
+
+        await client.post(
+            f"/api/session/{session_id}/message",
+            json={"parts": [{"type": "text", "text": "msg"}], "noReply": True},
+        )
+
+        clear_resp = await session_routes.send_session_command(
+            session_id,
+            session_routes.CommandRequest(command="clear"),
+        )
+        assert clear_resp["status"] == "accepted"
+
+        pending = list(getattr(session_routes.router, "_pending_tasks", set()))
+        assert pending
+        await asyncio.gather(*pending)
+
         list_resp = await client.get(f"/api/session/{session_id}/message")
         assert list_resp.json() == []
 
