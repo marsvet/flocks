@@ -33,6 +33,20 @@
   "loading": "Loading...",
   "noAgents": "No agents available",
   "smartAssistant": "AI Smart Assistant",
+  "agentPicker": {
+    "title": "Choose Chat Agent",
+    "hint": "Use this agent by default; type @Agent to route one message",
+    "filter": {
+      "all": "All",
+      "builtin": "Built-in",
+      "custom": "Custom"
+    },
+    "badge": {
+      "primary": "Primary",
+      "builtin": "Built-in",
+      "custom": "Custom"
+    }
+  },
   "welcome": {
     "title": "Start a new conversation",
     "description": "AI-native security operations assistant — threat analysis, incident response, and security orchestration",
@@ -94,6 +108,11 @@
       "mergeFailed": "Merge failed",
       "summarizeDone": "Summary written ({{chars}} chars)",
       "complete": "Compaction complete"
+    },
+    "mention": {
+      "title": "Choose Agent",
+      "navigate": "Navigate",
+      "select": "Select"
     },
     "removeNodeRef": "Remove node reference",
     "errors": {

@@ -6,7 +6,6 @@ import pytest
 from flocks.tool.device.prompt import build_device_context_section
 from flocks.tool.registry import ParameterType, ToolCategory, ToolInfo, ToolParameter
 
-
 def _stub_groups(monkeypatch: pytest.MonkeyPatch, groups):
     monkeypatch.setattr(
         "flocks.tool.device.prompt.list_groups", AsyncMock(return_value=groups)
