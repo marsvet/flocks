@@ -685,13 +685,8 @@ async def unshare_session_local(sessionID: str, http_request: Request) -> Sessio
 # Session Actions
 # =============================================================================
 
-@router.post(
-    "/{sessionID}/abort",
-    summary="Abort session",
-    description="Abort an active session and stop any ongoing processing",
-)
-async def abort_session(sessionID: str, http_request: Request) -> bool:
-    """Abort session processing.
+async def _abort_session_processing(sessionID: str) -> bool:
+    """Abort active processing for a session and notify subscribers.
 
     Aborts both the SessionLoop (sets abort_event so the next step check
     stops the loop) and the SessionRunner (stops the current LLM stream).
@@ -704,15 +699,6 @@ async def abort_session(sessionID: str, http_request: Request) -> bool:
     from flocks.session.runner import SessionRunner
     from flocks.session.session_loop import SessionLoop
     from flocks.server.routes.question import reject_session_questions
-
-    current_user = require_user(http_request)
-    session = await _get_session_by_id_unfiltered(sessionID)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {sessionID} not found",
-        )
-    _require_session_write_access(session, current_user)
 
     # Abort the loop-level context (propagates to runner via shared abort_event)
     loop_aborted = SessionLoop.abort(sessionID)
@@ -755,6 +741,25 @@ async def abort_session(sessionID: str, http_request: Request) -> bool:
         log.warn("session.abort.event_error", {"error": str(exc)})
 
     return True
+
+
+@router.post(
+    "/{sessionID}/abort",
+    summary="Abort session",
+    description="Abort an active session and stop any ongoing processing",
+)
+async def abort_session(sessionID: str, http_request: Request = None) -> bool:
+    """Abort session processing."""
+    if http_request is not None:
+        current_user = require_user(http_request)
+        session = await _get_session_by_id_unfiltered(sessionID)
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {sessionID} not found",
+            )
+        _require_session_write_access(session, current_user)
+    return await _abort_session_processing(sessionID)
 
 
 class ForkRequest(BaseModel):
@@ -2427,7 +2432,7 @@ async def _process_session_message(
                 _, _, tail = filename_hint.rpartition(".")
                 if tail.lower() in _UPLOAD_SAFE_EXTS:
                     ext = "." + tail.lower()
-            unique_name = f"{Identifier.create('upload')}{ext}"
+            unique_name = f"{Identifier.create('part')}{ext}"
             target = uploads_root / unique_name
             target.write_bytes(raw_bytes)
             return f"file://{target.resolve()}"
@@ -2828,6 +2833,220 @@ def _coerce_model_for_prompt_request(model: Any):
     return model
 
 
+def _prompt_queue_lock(session_id: str) -> asyncio.Lock:
+    if not hasattr(router, "_prompt_queue_drain_locks"):
+        router._prompt_queue_drain_locks = {}
+    locks = router._prompt_queue_drain_locks
+    lock = locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[session_id] = lock
+    return lock
+
+
+def _is_prompt_chain_active(session_id: str) -> bool:
+    return session_id in getattr(router, "_prompt_queue_active_sessions", set())
+
+
+def _set_prompt_chain_active(session_id: str, active: bool) -> None:
+    if not hasattr(router, "_prompt_queue_active_sessions"):
+        router._prompt_queue_active_sessions = set()
+    active_sessions = router._prompt_queue_active_sessions
+    if active:
+        active_sessions.add(session_id)
+    else:
+        active_sessions.discard(session_id)
+
+
+async def _publish_prompt_queue(session_id: str) -> None:
+    from flocks.server.routes.event import publish_event
+    from flocks.session.interaction_queue import InteractionQueue
+
+    items = await InteractionQueue.list(session_id)
+    await publish_event("session.prompt_queue.updated", {
+        "sessionID": session_id,
+        "items": [item.model_dump() for item in items],
+    })
+
+
+def _materialize_queued_parts(session_id: str, parts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Persist queued data URLs so large base64 payloads do not sit in memory."""
+    prepared: List[Dict[str, Any]] = []
+    for part in parts:
+        next_part = dict(part)
+        url = next_part.get("url")
+        if next_part.get("type") == "file" and isinstance(url, str) and url.startswith("data:"):
+            mime = next_part.get("mime") or ""
+            filename = next_part.get("filename")
+            next_part["url"] = _materialize_data_url_part(session_id, url, mime, filename)
+        prepared.append(next_part)
+    return prepared
+
+
+def _materialize_data_url_part(
+    session_id: str,
+    data_url: str,
+    mime_hint: str,
+    filename_hint: Optional[str],
+) -> str:
+    try:
+        import base64
+        from flocks.workspace.manager import WorkspaceManager
+        from flocks.utils.id import Identifier
+
+        _header, _sep, encoded = data_url.partition(",")
+        if not encoded:
+            return data_url
+        raw_bytes = base64.b64decode(encoded)
+        ws = WorkspaceManager.get_instance()
+        uploads_root = ws.resolve_workspace_path(f"uploads/{session_id}")
+        uploads_root.mkdir(parents=True, exist_ok=True)
+
+        ext_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "application/pdf": ".pdf",
+        }
+        ext = ext_map.get(mime_hint, "")
+        if not ext and filename_hint:
+            _, _, tail = filename_hint.rpartition(".")
+            if tail.lower() in _UPLOAD_SAFE_EXTS:
+                ext = "." + tail.lower()
+        target = uploads_root / f"{Identifier.create('part')}{ext}"
+        target.write_bytes(raw_bytes)
+        return f"file://{target.resolve()}"
+    except Exception as exc:
+        log.warn("session.prompt_queue.materialize_failed", {
+            "sessionID": session_id,
+            "error": str(exc),
+        })
+        return data_url
+
+
+def _event_from_queued_prompt(item, working_directory: str):
+    from flocks.input.events import UserInputEvent
+
+    return UserInputEvent(
+        source_type="webui",
+        sessionID=item.sessionID,
+        text=_extract_text_from_parts(item.parts),
+        parts=[dict(part) for part in item.parts],
+        agent=item.agent,
+        model=item.model,
+        variant=item.variant,
+        display_text=None,
+        messageID=item.messageID,
+        noReply=item.noReply,
+        mockReply=item.mockReply,
+        tools=item.tools,
+        system=item.system,
+        working_directory=working_directory,
+    )
+
+
+async def _drain_prompt_queue_locked(session_id: str, working_directory: str) -> bool:
+    from flocks.project.bootstrap import instance_bootstrap
+    from flocks.project.instance import Instance
+    from flocks.session.interaction_queue import InteractionQueue
+    from flocks.session.session_loop import SessionLoop
+
+    while True:
+        if SessionLoop.is_running(session_id):
+            return False
+
+        item = await InteractionQueue.pop_next(session_id)
+        if item is None:
+            await _publish_prompt_queue(session_id)
+            return True
+
+        await _publish_prompt_queue(session_id)
+        session = await Session.get_by_id(session_id)
+        if not session:
+            log.warn("session.prompt_queue.session_missing", {"sessionID": session_id, "queueID": item.id})
+            continue
+
+        event = _event_from_queued_prompt(item, working_directory)
+        log.info("session.prompt_queue.dispatch", {
+            "sessionID": session_id,
+            "queueID": item.id,
+        })
+        await Instance.provide(
+            directory=working_directory,
+            init=instance_bootstrap,
+            fn=lambda: _dispatch_sse_input(session_id, session, event, working_directory),
+        )
+
+
+async def _run_prompt_event_chain(session_id: str, session, event, working_directory: str) -> None:
+    from flocks.project.bootstrap import instance_bootstrap
+    from flocks.project.instance import Instance
+
+    try:
+        async with _prompt_queue_lock(session_id):
+            dispatch_failed = False
+            try:
+                await Instance.provide(
+                    directory=working_directory,
+                    init=instance_bootstrap,
+                    fn=lambda: _dispatch_sse_input(session_id, session, event, working_directory),
+                )
+            except Exception:
+                dispatch_failed = True
+                raise
+            finally:
+                try:
+                    await _drain_prompt_queue_locked(session_id, working_directory)
+                except Exception as drain_exc:
+                    if dispatch_failed:
+                        log.error("session.prompt_queue.drain_after_error_failed", {
+                            "sessionID": session_id,
+                            "error": str(drain_exc),
+                        })
+                    else:
+                        raise
+    finally:
+        _set_prompt_chain_active(session_id, False)
+
+
+async def _schedule_prompt_queue_drain(session_id: str, working_directory: str) -> None:
+    max_attempts = 80
+    retry_interval_s = 0.25
+
+    async def _run() -> None:
+        try:
+            async with _prompt_queue_lock(session_id):
+                for attempt in range(max_attempts):
+                    completed = await _drain_prompt_queue_locked(session_id, working_directory)
+                    if completed:
+                        return
+                    await asyncio.sleep(retry_interval_s)
+                log.warn("session.prompt_queue.drain_retry_exhausted", {
+                    "sessionID": session_id,
+                    "attempts": max_attempts,
+                })
+        finally:
+            _set_prompt_chain_active(session_id, False)
+
+    _set_prompt_chain_active(session_id, True)
+    _schedule_background_coro(
+        _run(),
+        session_id=session_id,
+        action="prompt_queue.drain",
+    )
+
+
+async def _wait_for_session_idle(session_id: str, timeout_s: float = 5.0) -> None:
+    from flocks.session.session_loop import SessionLoop
+
+    deadline = time.time() + timeout_s
+    while SessionLoop.is_running(session_id) and time.time() < deadline:
+        await asyncio.sleep(0.05)
+
+
 def _build_prompt_request_from_event(event, prompt_text: str, display_text: Optional[str] = None):
     import types
 
@@ -2952,6 +3171,9 @@ async def _dispatch_sse_input(sessionID: str, session, event, working_directory:
         request = _build_prompt_request_from_event(output_event, prompt_text, display_text)
         await _process_session_message(sessionID, session, request, working_directory)
 
+    async def _clear_history() -> None:
+        await _clear_session_history(sessionID)
+
     async def _run_session_control(output_event, parsed) -> bool:
         if parsed.canonical_name != "compact":
             return False
@@ -2987,8 +3209,151 @@ async def _dispatch_sse_input(sessionID: str, session, event, working_directory:
         direct_response=_publish_direct_response,
         run_llm=_run_llm,
         session_control=_run_session_control,
+        clear_history=_clear_history,
     )
     await dispatch_user_input(event, sink)
+
+
+class PromptQueueUpdateRequest(BaseModel):
+    text: str = Field(..., description="Updated queued prompt text")
+
+
+async def _enqueue_prompt_request(
+    session_id: str,
+    request: PromptRequest,
+):
+    from flocks.session.interaction_queue import InteractionQueue
+
+    model = request.model.model_dump(by_alias=True) if request.model else None
+    parts = _materialize_queued_parts(session_id, [dict(part) for part in request.parts])
+    return await InteractionQueue.enqueue(
+        session_id,
+        parts=parts,
+        agent=request.agent,
+        model=model,
+        variant=request.variant,
+        message_id=request.messageID,
+        no_reply=request.noReply,
+        mock_reply=request.mockReply,
+        tools=request.tools,
+        system=request.system,
+    )
+
+
+@router.get(
+    "/{sessionID}/prompt_queue",
+    summary="List queued prompts",
+    description="List pending non-blocking prompts for a session",
+)
+async def list_prompt_queue(sessionID: str) -> Dict[str, Any]:
+    from flocks.session.interaction_queue import InteractionQueue
+
+    session = await Session.get_by_id(sessionID)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {sessionID} not found",
+        )
+    items = await InteractionQueue.list(sessionID)
+    return {"sessionID": sessionID, "items": [item.model_dump() for item in items]}
+
+
+@router.post(
+    "/{sessionID}/prompt_queue",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue prompt",
+    description="Queue a prompt without writing it to the formal message history",
+)
+async def enqueue_prompt(sessionID: str, request: PromptRequest) -> Dict[str, Any]:
+    from flocks.session.interaction_queue import QueueFullError
+
+    session = await Session.get_by_id(sessionID)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {sessionID} not found",
+        )
+    try:
+        item = await _enqueue_prompt_request(sessionID, request)
+    except QueueFullError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    await _publish_prompt_queue(sessionID)
+    return {"status": "queued", "sessionID": sessionID, "queueID": item.id}
+
+
+@router.patch(
+    "/{sessionID}/prompt_queue/{queueID}",
+    summary="Update queued prompt",
+    description="Update the text part of a queued prompt",
+)
+async def update_prompt_queue_item(
+    sessionID: str,
+    queueID: str,
+    request: PromptQueueUpdateRequest,
+) -> Dict[str, Any]:
+    from flocks.session.interaction_queue import InteractionQueue, QueueItemNotFoundError
+
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Queued prompt text cannot be empty",
+        )
+    try:
+        item = await InteractionQueue.update_text(sessionID, queueID, text)
+    except QueueItemNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    await _publish_prompt_queue(sessionID)
+    return {"status": "updated", "sessionID": sessionID, "item": item.model_dump()}
+
+
+@router.delete(
+    "/{sessionID}/prompt_queue/{queueID}",
+    summary="Remove queued prompt",
+    description="Remove a queued prompt before it executes",
+)
+async def remove_prompt_queue_item(sessionID: str, queueID: str) -> Dict[str, Any]:
+    from flocks.session.interaction_queue import InteractionQueue, QueueItemNotFoundError
+
+    try:
+        await InteractionQueue.remove(sessionID, queueID)
+    except QueueItemNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    await _publish_prompt_queue(sessionID)
+    return {"status": "removed", "sessionID": sessionID, "queueID": queueID}
+
+
+@router.post(
+    "/{sessionID}/prompt_queue/{queueID}/run_now",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Run queued prompt now",
+    description="Abort the current prompt and run the selected queued prompt next",
+)
+async def run_prompt_queue_item_now(sessionID: str, queueID: str) -> Dict[str, Any]:
+    import os
+
+    from flocks.session.interaction_queue import InteractionQueue, QueueItemNotFoundError
+    from flocks.session.session_loop import SessionLoop
+
+    session = await Session.get_by_id(sessionID)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {sessionID} not found",
+        )
+    working_directory = session.directory or os.getcwd()
+    try:
+        await InteractionQueue.promote(sessionID, queueID)
+    except QueueItemNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    await _publish_prompt_queue(sessionID)
+
+    if SessionLoop.is_running(sessionID):
+        await abort_session(sessionID)
+        await _wait_for_session_idle(sessionID)
+
+    await _schedule_prompt_queue_drain(sessionID, working_directory)
+    return {"status": "accepted", "sessionID": sessionID, "queueID": queueID}
 
 
 @router.post(
@@ -3005,6 +3370,8 @@ async def send_session_message_async(
     """Send message asynchronously - returns 202 immediately, response via SSE"""
     import os
     from flocks.input.events import UserInputEvent
+    from flocks.session.interaction_queue import InteractionQueue, QueueFullError
+    from flocks.session.session_loop import SessionLoop
 
     session = await _get_session_by_id_unfiltered(sessionID)
     if not session:
@@ -3038,61 +3405,24 @@ async def send_session_message_async(
         system=request.system,
         working_directory=working_directory,
     )
-    
-    # Use the same synchronous processing path as send_session_message
-    # but run it as a background task via asyncio.ensure_future
-    import asyncio
-    
-    async def _run_in_background():
-        import traceback
-        import sys
+
+    existing_queue = await InteractionQueue.list(sessionID)
+    if SessionLoop.is_running(sessionID) or existing_queue or _is_prompt_chain_active(sessionID):
         try:
-            log.info("session.prompt_async.processing_start", {
-                "sessionID": sessionID,
-            })
-            
-            from flocks.project.instance import Instance
-            from flocks.project.bootstrap import instance_bootstrap
-            
-            await Instance.provide(
-                directory=working_directory,
-                init=instance_bootstrap,
-                fn=lambda: _dispatch_sse_input(sessionID, session, event, working_directory),
-            )
-            log.info("session.prompt_async.processing_complete", {
-                "sessionID": sessionID,
-            })
-        except Exception as e:
-            tb = traceback.format_exc()
-            log.error("session.prompt_async.error", {
-                "sessionID": sessionID,
-                "error": str(e),
-                "error_type": type(e).__name__,
-            })
-            print(f"[prompt_async ERROR] {sessionID}: {e}\n{tb}", file=sys.stderr, flush=True)
-            # Clear session busy status on error
-            try:
-                from flocks.session.core.status import SessionStatus
-                SessionStatus.clear(sessionID)
-            except Exception:
-                pass
-            # Publish error event so frontend gets notified
-            from flocks.server.routes.event import publish_event
-            error_msg = str(e)
-            await publish_event("session.error", {
-                "sessionID": sessionID,
-                "error": {"name": type(e).__name__, "message": error_msg, "data": {"message": error_msg}},
-            })
-    
-    # Schedule as asyncio task with explicit reference tracking
-    loop = asyncio.get_running_loop()
-    task = loop.create_task(_run_in_background())
-    # Store reference on the app state to prevent GC
-    if not hasattr(router, '_pending_tasks'):
-        router._pending_tasks = set()
-    router._pending_tasks.add(task)
-    task.add_done_callback(lambda t: router._pending_tasks.discard(t))
-    
+            item = await _enqueue_prompt_request(sessionID, request)
+        except QueueFullError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        await _publish_prompt_queue(sessionID)
+        if not SessionLoop.is_running(sessionID):
+            await _schedule_prompt_queue_drain(sessionID, working_directory)
+        return {"status": "queued", "sessionID": sessionID, "queueID": item.id}
+
+    _set_prompt_chain_active(sessionID, True)
+    _schedule_background_coro(
+        _run_prompt_event_chain(sessionID, session, event, working_directory),
+        session_id=sessionID,
+        action="session.prompt_async",
+    )
     return {"status": "accepted", "sessionID": sessionID}
 
 
@@ -3115,13 +3445,14 @@ class CommandRequest(BaseModel):
     summary="Send command",
     description="Execute a slash command in the session (returns 202, result via SSE)",
 )
-async def send_session_command(sessionID: str, request: CommandRequest, http_request: Request):
+async def send_session_command(sessionID: str, request: CommandRequest, http_request: Request = None):
     """
     Execute a slash command.
 
-    Direct commands (/tools, /skills, /help, /mcp, /clear) are handled
-    without calling the LLM.  Their output is pushed as an assistant message
-    directly via SSE.
+    Direct commands (/tools, /skills, /help, /mcp) are handled without calling
+    the LLM. Their output is pushed as an assistant message directly via SSE.
+    Side-effecting direct commands like /clear run without creating a chat
+    message and instead update session state via callbacks.
 
     LLM-based commands (/plan, /ask, /init, /compact, ...) are routed through
     the normal session-loop pipeline.
@@ -3142,8 +3473,9 @@ async def send_session_command(sessionID: str, request: CommandRequest, http_req
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {sessionID} not found",
         )
-    current_user = require_user(http_request)
-    _require_session_write_access(session, current_user)
+    if http_request is not None:
+        current_user = require_user(http_request)
+        _require_session_write_access(session, current_user)
 
     working_directory = session.directory or os.getcwd()
 
@@ -3452,6 +3784,41 @@ async def get_session_statistics(sessionID: str):
         raise HTTPException(status_code=500, detail=f"Failed to get session statistics: {str(e)}")
 
 
+async def _clear_session_history(sessionID: str) -> int:
+    """Clear stored messages for a session and notify subscribed UIs."""
+    session_info = await _get_session_by_id_unfiltered(sessionID)
+    if not session_info:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {sessionID} not found",
+        )
+
+    from flocks.server.routes.event import publish_event
+    from flocks.session.interaction_queue import InteractionQueue
+    from flocks.session.message import Message
+
+    await abort_session(sessionID)
+    await InteractionQueue.clear(sessionID)
+    try:
+        await _publish_prompt_queue(sessionID)
+    except Exception as exc:
+        log.warn("session.clear.prompt_queue_event_error", {"sessionID": sessionID, "error": str(exc)})
+    await _wait_for_session_idle(sessionID)
+
+    deleted_count = await Message.clear(sessionID)
+    log.info("session.cleared", {"sessionID": sessionID, "deleted": deleted_count})
+
+    try:
+        await publish_event("session.cleared", {
+            "sessionID": sessionID,
+            "deletedMessages": deleted_count,
+        })
+    except Exception as exc:
+        log.warn("session.clear.event_error", {"sessionID": sessionID, "error": str(exc)})
+
+    return deleted_count
+
+
 @router.post("/{sessionID}/clear")
 async def clear_session(sessionID: str, http_request: Request):
     """
@@ -3460,7 +3827,6 @@ async def clear_session(sessionID: str, http_request: Request):
     Removes all messages from the session while keeping the session itself.
     """
     try:
-        # Verify session exists
         session_info = await _get_session_by_id_unfiltered(sessionID)
         if not session_info:
             raise HTTPException(
@@ -3470,16 +3836,14 @@ async def clear_session(sessionID: str, http_request: Request):
         current_user = require_user(http_request)
         _require_session_write_access(session_info, current_user)
 
-        # Use Message.clear which handles bulk deletion atomically
-        from flocks.session.message import Message
-        deleted_count = await Message.clear(sessionID)
-
-        log.info("session.cleared", {"sessionID": sessionID, "deleted": deleted_count})
+        deleted_count = await _clear_session_history(sessionID)
         return {
             "status": "success",
             "sessionID": sessionID,
             "deletedMessages": deleted_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("session.clear.error", {"sessionID": sessionID, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to clear session: {str(e)}")

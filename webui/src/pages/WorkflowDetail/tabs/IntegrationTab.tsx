@@ -10,6 +10,8 @@ import {
   WorkflowService,
   WorkflowServiceDriver,
   SyslogListenerStatus,
+  KafkaConsumerStatus,
+  WorkflowPollerStatus,
 } from '@/api/workflow';
 import CopyButton from '@/components/common/CopyButton';
 import WorkflowStatusBadge from '@/components/common/WorkflowStatusBadge';
@@ -49,6 +51,41 @@ function SectionHeader({
       )}
     </button>
   );
+}
+
+const DEFAULT_RUNTIME_INPUTS_TEXT = JSON.stringify({}, null, 2);
+const KAFKA_RAW_INPUT_KEYS = new Set(['kafka_message', 'kafka_value', 'kafka_record']);
+
+function stripExecutionOnlyComments(value: unknown, excludedKeys: ReadonlySet<string> = new Set()): unknown {
+  if (Array.isArray(value)) {
+    return value.map(item => stripExecutionOnlyComments(item, excludedKeys));
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !key.startsWith('_comment') && !excludedKeys.has(key))
+      .map(([key, nestedValue]) => [key, stripExecutionOnlyComments(nestedValue, excludedKeys)]),
+  );
+}
+
+function stringifyRuntimeInputs(value: unknown, excludedKeys: ReadonlySet<string> = new Set()): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return DEFAULT_RUNTIME_INPUTS_TEXT;
+  }
+  return JSON.stringify(stripExecutionOnlyComments(value, excludedKeys), null, 2);
+}
+
+function formatTimestamp(ts?: number | null): string {
+  if (!ts) return '-';
+  return new Date(ts).toLocaleString();
+}
+
+function formatDuration(ms?: number | null): string {
+  if (typeof ms !== 'number') return '-';
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 // ─────────────────────────────────────────────
@@ -262,35 +299,149 @@ function KafkaSection({ workflowId }: { workflowId: string }) {
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [enabled, setEnabled] = useState(false);
   const [inputBroker, setInputBroker] = useState('');
   const [inputTopic, setInputTopic] = useState('');
   const [inputGroupId, setInputGroupId] = useState('');
-  const [outputBroker, setOutputBroker] = useState('');
-  const [outputTopic, setOutputTopic] = useState('');
+  const [inputKey, setInputKey] = useState('kafka_message');
+  const [inputsText, setInputsText] = useState(DEFAULT_RUNTIME_INPUTS_TEXT);
+  // Runtime consumer state (independent from saved config) — only this should
+  // drive the "Running" indicator, otherwise a connection failure leaves the UI
+  // falsely showing the consumer as active.
+  const [consumer, setConsumer] = useState<KafkaConsumerStatus | null>(null);
+  const [saveError, setSaveError] = useState('');
+  const [jsonError, setJsonError] = useState('');
 
-  useEffect(() => {
-    workflowAPI.getKafkaConfig(workflowId).then(res => {
-      if (res.data) {
-        setInputBroker(res.data.inputBroker || '');
-        setInputTopic(res.data.inputTopic || '');
-        setInputGroupId(res.data.inputGroupId || '');
-        setOutputBroker(res.data.outputBroker || '');
-        setOutputTopic(res.data.outputTopic || '');
-      }
-    }).catch(() => {});
+  const refreshStatus = useCallback(async () => {
+    try {
+      const res = await workflowAPI.getKafkaStatus(workflowId);
+      setConsumer(res.data);
+    } catch {
+      // ignore — older backend / transient failure
+    }
   }, [workflowId]);
 
+  const isRunning = consumer?.state === 'running';
+  const isConnecting = consumer?.state === 'connecting';
+  const isFailed = consumer?.state === 'failed';
+
+  let summaryBadge: React.ReactNode;
+  if (isRunning) {
+    summaryBadge = (
+      <span className="text-xs text-green-600 font-normal">
+        {consumer?.topic || inputTopic}{' · '}{t('detail.run.kafkaActive')}
+      </span>
+    );
+  } else if (enabled && isConnecting) {
+    summaryBadge = (
+      <span className="text-xs text-amber-600 font-normal">
+        {inputTopic} · {t('detail.run.kafkaConnecting')}
+      </span>
+    );
+  } else if (enabled && isFailed) {
+    summaryBadge = (
+      <span className="text-xs text-red-600 font-normal">
+        {inputTopic} · {consumer?.error || 'failed'}
+      </span>
+    );
+  } else {
+    summaryBadge = null;
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadKafkaConfig = async () => {
+      let sampleInputs: Record<string, unknown> = {};
+      try {
+        const sampleRes = await workflowAPI.getSampleInputs(workflowId);
+        if (
+          sampleRes.data?.sampleInputs
+          && typeof sampleRes.data.sampleInputs === 'object'
+          && !Array.isArray(sampleRes.data.sampleInputs)
+        ) {
+          sampleInputs = sampleRes.data.sampleInputs;
+        }
+      } catch {
+        sampleInputs = {};
+      }
+
+      try {
+        const res = await workflowAPI.getKafkaConfig(workflowId);
+        if (cancelled) return;
+        if (res.data) {
+          setEnabled(!!res.data.enabled);
+          setInputBroker(res.data.inputBroker || '');
+          setInputTopic(res.data.inputTopic || '');
+          setInputGroupId(res.data.inputGroupId || '');
+          setInputKey(res.data.inputKey || 'kafka_message');
+          const configuredInputs = (
+            res.data.inputs
+            && typeof res.data.inputs === 'object'
+            && !Array.isArray(res.data.inputs)
+            && Object.keys(res.data.inputs).length > 0
+          )
+            ? res.data.inputs
+            : sampleInputs;
+          setInputsText(stringifyRuntimeInputs(configuredInputs, KAFKA_RAW_INPUT_KEYS));
+          return;
+        }
+        setInputsText(stringifyRuntimeInputs(sampleInputs, KAFKA_RAW_INPUT_KEYS));
+      } catch {
+        if (!cancelled) {
+          setInputsText(stringifyRuntimeInputs(sampleInputs, KAFKA_RAW_INPUT_KEYS));
+        }
+      }
+    };
+
+    loadKafkaConfig();
+    refreshStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [workflowId, refreshStatus]);
+
+  // While connecting, poll briefly so the UI converges on the real state.
+  useEffect(() => {
+    if (!isConnecting) return;
+    const handle = window.setInterval(() => {
+      refreshStatus();
+    }, 1500);
+    return () => window.clearInterval(handle);
+  }, [isConnecting, refreshStatus]);
+
   const handleSave = async () => {
+    let parsedInputs: Record<string, any>;
+    try {
+      const parsed = JSON.parse(inputsText);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setJsonError(t('detail.run.kafkaInputsJsonError'));
+        return;
+      }
+      parsedInputs = stripExecutionOnlyComments(parsed, KAFKA_RAW_INPUT_KEYS) as Record<string, any>;
+      setJsonError('');
+    } catch {
+      setJsonError(t('detail.run.kafkaInputsJsonError'));
+      return;
+    }
+
     setSaving(true);
     setSaved(false);
+    setSaveError('');
     try {
-      await workflowAPI.saveKafkaConfig(workflowId, {
-        inputBroker, inputTopic, inputGroupId, outputBroker, outputTopic,
+      const res = await workflowAPI.saveKafkaConfig(workflowId, {
+        enabled, inputBroker, inputTopic, inputGroupId, inputKey, inputs: parsedInputs,
       });
+      if (res.data?.consumer) {
+        setConsumer(res.data.consumer);
+      } else {
+        refreshStatus();
+      }
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch {
-      // ignore - stub endpoint may return 501
+    } catch (err: unknown) {
+      setSaveError(extractErrorMessage(err, t('detail.run.savingConfig')));
+      refreshStatus();
     } finally {
       setSaving(false);
     }
@@ -309,13 +460,33 @@ function KafkaSection({ workflowId }: { workflowId: string }) {
     </div>
   );
 
+  const toggleOption = (
+    id: string,
+    label: string,
+    checked: boolean,
+    onChange: (checked: boolean) => void,
+  ) => (
+    <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-gray-50 px-3 py-2">
+      <label htmlFor={id} className="block min-w-0 text-xs font-medium text-gray-600">
+        {label}
+      </label>
+      <input
+        id={id}
+        type="checkbox"
+        checked={checked}
+        onChange={e => onChange(e.target.checked)}
+        className="rounded border-gray-300 text-red-600 focus:ring-red-500"
+      />
+    </div>
+  );
+
   return (
     <div className="border-b border-gray-100">
       <SectionHeader
         title={t('detail.run.kafkaSection')}
         expanded={expanded}
         onToggle={() => setExpanded(v => !v)}
-        badge={<span className="text-xs text-gray-400 font-normal">{t('detail.run.kafkaExperimental')}</span>}
+        badge={summaryBadge}
       />
       {expanded && (
         <div className="p-4 space-y-4">
@@ -326,13 +497,29 @@ function KafkaSection({ workflowId }: { workflowId: string }) {
             {inputField('Broker', inputBroker, setInputBroker, 'localhost:9092')}
             {inputField('Topic', inputTopic, setInputTopic, 'workflow-input')}
             {inputField('Consumer Group', inputGroupId, setInputGroupId, 'flocks-consumer')}
+            {inputField(t('detail.run.kafkaInputKey'), inputKey, setInputKey, 'kafka_message')}
           </div>
           <div className="space-y-2">
-            <p className="text-xs font-medium text-gray-600 flex items-center gap-1">
-              <Wifi className="w-3.5 h-3.5 rotate-180" /> {t('detail.run.outputConfig')}
-            </p>
-            {inputField('Broker', outputBroker, setOutputBroker, 'localhost:9092')}
-            {inputField('Topic', outputTopic, setOutputTopic, 'workflow-output')}
+            <label className="block text-xs text-gray-500" htmlFor={`kafka-inputs-${workflowId}`}>
+              {t('detail.run.kafkaInputs')}
+            </label>
+            <textarea
+              id={`kafka-inputs-${workflowId}`}
+              value={inputsText}
+              onChange={e => setInputsText(e.target.value)}
+              rows={8}
+              className="w-full text-xs font-mono border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-red-500"
+              spellCheck={false}
+            />
+            <p className="text-xs text-gray-400">{t('detail.run.kafkaInputsHint')}</p>
+          </div>
+          <div>
+            {toggleOption(
+              `kafka-enabled-${workflowId}`,
+              t('detail.run.kafkaEnabled'),
+              enabled,
+              setEnabled,
+            )}
           </div>
           <button
             type="button"
@@ -347,7 +534,349 @@ function KafkaSection({ workflowId }: { workflowId: string }) {
             ) : null}
             {saving ? t('detail.run.savingConfig') : saved ? t('detail.run.savedConfig') : t('detail.run.saveConfig')}
           </button>
+          {jsonError && (
+            <div className="flex items-start gap-1.5 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+              <span className="flex-1">{jsonError}</span>
+            </div>
+          )}
+          {saveError && (
+            <div className="flex items-start gap-1.5 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+              <span className="flex-1">{saveError}</span>
+            </div>
+          )}
+          {enabled && isFailed && !saveError && (
+            <div className="flex items-start gap-1.5 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+              <span className="flex-1">
+                {t('detail.run.kafkaFailed')}: {consumer?.error || 'unknown error'}
+              </span>
+            </div>
+          )}
+          {enabled && isRunning && typeof consumer?.queueSize === 'number' && (
+            <p className="text-xs text-gray-500 text-center">
+              queue {consumer.queueSize}/{consumer.queueCapacity ?? '?'} · workers {consumer.workerCount ?? '?'}
+            </p>
+          )}
           <p className="text-xs text-gray-400 text-center">{t('detail.run.kafkaHint')}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PollerSection({ workflowId }: { workflowId: string }) {
+  const { t } = useTranslation('workflow');
+  const [expanded, setExpanded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [runningOnce, setRunningOnce] = useState(false);
+  const [enabled, setEnabled] = useState(false);
+  const [intervalSeconds, setIntervalSeconds] = useState('30');
+  const [timeoutSeconds, setTimeoutSeconds] = useState('7200');
+  const [noOverlap, setNoOverlap] = useState(true);
+  const [inputsText, setInputsText] = useState(DEFAULT_RUNTIME_INPUTS_TEXT);
+  const [jsonError, setJsonError] = useState('');
+  const [saveError, setSaveError] = useState('');
+  const [poller, setPoller] = useState<WorkflowPollerStatus | null>(null);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const res = await workflowAPI.getPollerStatus(workflowId);
+      setPoller(res.data);
+    } catch {
+      // ignore transient backend errors
+    }
+  }, [workflowId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadPollerConfig = async () => {
+      let sampleInputs: Record<string, unknown> = {};
+      try {
+        const sampleRes = await workflowAPI.getSampleInputs(workflowId);
+        if (sampleRes.data?.sampleInputs && typeof sampleRes.data.sampleInputs === 'object' && !Array.isArray(sampleRes.data.sampleInputs)) {
+          sampleInputs = sampleRes.data.sampleInputs;
+        }
+      } catch {
+        sampleInputs = {};
+      }
+
+      try {
+        const res = await workflowAPI.getPollerConfig(workflowId);
+        if (cancelled) return;
+        if (res.data) {
+          setEnabled(!!res.data.enabled);
+          setIntervalSeconds(String(res.data.intervalSeconds ?? 30));
+          setTimeoutSeconds(String(res.data.timeoutSeconds ?? 7200));
+          setNoOverlap(res.data.noOverlap ?? true);
+          const configuredInputs = (
+            res.data.inputs
+            && typeof res.data.inputs === 'object'
+            && !Array.isArray(res.data.inputs)
+            && Object.keys(res.data.inputs).length > 0
+          )
+            ? res.data.inputs
+            : sampleInputs;
+          setInputsText(stringifyRuntimeInputs(configuredInputs));
+          return;
+        }
+        setInputsText(stringifyRuntimeInputs(sampleInputs));
+      } catch {
+        if (!cancelled) {
+          setInputsText(stringifyRuntimeInputs(sampleInputs));
+        }
+      }
+    };
+
+    loadPollerConfig();
+    refreshStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [workflowId, refreshStatus]);
+
+  useEffect(() => {
+    if (poller?.state !== 'running') return;
+    const handle = window.setInterval(() => {
+      refreshStatus();
+    }, 3000);
+    return () => window.clearInterval(handle);
+  }, [poller?.state, refreshStatus]);
+
+  const validateInputs = (): Record<string, any> | null => {
+    try {
+      const parsed = JSON.parse(inputsText);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setJsonError(t('detail.run.pollerInputsJsonError'));
+        return null;
+      }
+      setJsonError('');
+      return stripExecutionOnlyComments(parsed) as Record<string, any>;
+    } catch {
+      setJsonError(t('detail.run.pollerInputsJsonError'));
+      return null;
+    }
+  };
+
+  const handleSave = async () => {
+    const parsedInputs = validateInputs();
+    if (!parsedInputs) return;
+
+    setSaving(true);
+    setSaved(false);
+    setSaveError('');
+    try {
+      const res = await workflowAPI.savePollerConfig(workflowId, {
+        enabled,
+        intervalSeconds: Math.max(1, Number.parseInt(intervalSeconds, 10) || 30),
+        timeoutSeconds: Math.max(1, Number.parseInt(timeoutSeconds, 10) || 7200),
+        noOverlap,
+        inputs: parsedInputs,
+      });
+      if (res.data?.status) {
+        setPoller(res.data.status);
+      } else {
+        refreshStatus();
+      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err: unknown) {
+      setSaveError(extractErrorMessage(err, t('detail.run.savingConfig')));
+      refreshStatus();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleRunOnce = async () => {
+    setRunningOnce(true);
+    setSaveError('');
+    try {
+      const res = await workflowAPI.runPollerOnce(workflowId);
+      if (res.data?.status) {
+        setPoller(res.data.status);
+      } else {
+        refreshStatus();
+      }
+    } catch (err: unknown) {
+      setSaveError(extractErrorMessage(err, t('detail.run.pollerRunOnceFailed')));
+    } finally {
+      setRunningOnce(false);
+    }
+  };
+
+  let summaryBadge: React.ReactNode;
+  if (poller?.state === 'running') {
+    summaryBadge = (
+      <span className="text-xs text-green-600 font-normal">
+        {t('detail.run.pollerRunning')}
+      </span>
+    );
+  } else if (poller?.state === 'failed') {
+    summaryBadge = (
+      <span className="text-xs text-red-600 font-normal">
+        {poller.error || t('detail.run.pollerFailed')}
+      </span>
+    );
+  } else if (enabled) {
+    summaryBadge = (
+      <span className="text-xs text-amber-600 font-normal">
+        {t('detail.run.pollerEnabledIdle')}
+      </span>
+    );
+  } else {
+    summaryBadge = null;
+  }
+
+  const statusBadgeClass = poller?.state === 'running'
+    ? 'bg-green-50 text-green-700 border-green-200'
+    : poller?.state === 'failed'
+      ? 'bg-red-50 text-red-700 border-red-200'
+      : 'bg-gray-50 text-gray-600 border-gray-200';
+
+  return (
+    <div className="border-b border-gray-100">
+      <SectionHeader
+        title={t('detail.run.pollerSection')}
+        expanded={expanded}
+        onToggle={() => setExpanded(v => !v)}
+        badge={summaryBadge}
+      />
+      {expanded && (
+        <div className="p-4 space-y-4">
+          <div className="grid grid-cols-2 gap-2">
+            <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-gray-50 px-3 py-2">
+              <label htmlFor={`poller-enabled-${workflowId}`} className="text-xs font-medium text-gray-600">
+                {t('detail.run.pollerEnabled')}
+              </label>
+              <input
+                id={`poller-enabled-${workflowId}`}
+                type="checkbox"
+                checked={enabled}
+                onChange={e => setEnabled(e.target.checked)}
+                className="rounded border-gray-300 text-red-600 focus:ring-red-500"
+              />
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-gray-50 px-3 py-2">
+              <label htmlFor={`poller-no-overlap-${workflowId}`} className="text-xs font-medium text-gray-600">
+                {t('detail.run.pollerNoOverlap')}
+              </label>
+              <input
+                id={`poller-no-overlap-${workflowId}`}
+                type="checkbox"
+                checked={noOverlap}
+                onChange={e => setNoOverlap(e.target.checked)}
+                className="rounded border-gray-300 text-red-600 focus:ring-red-500"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs text-gray-500 mb-1">{t('detail.run.pollerInterval')}</label>
+              <input
+                type="number"
+                min={1}
+                aria-label={t('detail.run.pollerInterval')}
+                value={intervalSeconds}
+                onChange={e => setIntervalSeconds(e.target.value)}
+                className="w-full text-xs border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-red-500"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-500 mb-1">{t('detail.run.pollerTimeout')}</label>
+              <input
+                type="number"
+                min={1}
+                aria-label={t('detail.run.pollerTimeout')}
+                value={timeoutSeconds}
+                onChange={e => setTimeoutSeconds(e.target.value)}
+                className="w-full text-xs border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-red-500"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">{t('detail.run.pollerInputs')}</label>
+            <textarea
+              aria-label={t('detail.run.pollerInputs')}
+              value={inputsText}
+              onChange={e => {
+                setInputsText(e.target.value);
+                if (jsonError) setJsonError('');
+              }}
+              rows={9}
+              className={`w-full text-xs font-mono border rounded-lg px-3 py-2 focus:outline-none focus:ring-1 ${
+                jsonError ? 'border-red-400 focus:ring-red-500' : 'border-gray-200 focus:ring-red-500'
+              }`}
+            />
+            {jsonError && (
+              <p className="text-xs text-red-500 mt-1">{jsonError}</p>
+            )}
+            <p className="text-xs text-gray-400 mt-2">{t('detail.run.pollerInputsHint')}</p>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving}
+              className="w-full flex items-center justify-center gap-2 py-2 border border-gray-200 text-gray-600 text-xs font-medium rounded-lg hover:bg-gray-50 disabled:opacity-60 transition-colors"
+            >
+              {saving ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : saved ? (
+                <Check className="w-3.5 h-3.5 text-green-500" />
+              ) : null}
+              {saving ? t('detail.run.savingConfig') : saved ? t('detail.run.savedConfig') : t('detail.run.saveConfig')}
+            </button>
+            <button
+              type="button"
+              onClick={handleRunOnce}
+              disabled={runningOnce}
+              className="w-full flex items-center justify-center gap-2 py-2 border border-red-200 text-red-600 text-xs font-medium rounded-lg hover:bg-red-50 disabled:opacity-60 transition-colors"
+            >
+              {runningOnce ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+              {runningOnce ? t('detail.run.pollerRunningOnce') : t('detail.run.pollerRunOnce')}
+            </button>
+          </div>
+
+          {saveError && (
+            <div className="flex items-start gap-1.5 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+              <span className="flex-1">{saveError}</span>
+            </div>
+          )}
+
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-3 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs font-medium text-gray-600">{t('detail.run.pollerStatus')}</span>
+              <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${statusBadgeClass}`}>
+                {poller?.state || 'stopped'}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs text-gray-600">
+              <div>{t('detail.run.pollerLastRunAt')}: {formatTimestamp(poller?.lastRunAt)}</div>
+              <div>{t('detail.run.pollerNextRunAt')}: {formatTimestamp(poller?.nextRunAt)}</div>
+              <div>{t('detail.run.pollerLastStatus')}: {poller?.lastStatus || '-'}</div>
+              <div>{t('detail.run.pollerLastDuration')}: {formatDuration(poller?.lastDurationMs)}</div>
+              <div>{t('detail.run.pollerSelectedCount')}: {poller?.selectedCount ?? '-'}</div>
+              <div>{t('detail.run.pollerActiveRuns')}: {poller?.activeRuns ?? 0}</div>
+              <div>{t('detail.run.pollerProcessedMarkCount')}: {poller?.processedMarkCount ?? '-'}</div>
+              <div>{t('detail.run.pollerChannelStatus')}: {poller?.channelNotifyStatus ?? '-'}</div>
+            </div>
+            {(poller?.lastError || poller?.error) && (
+              <div className="flex items-start gap-1.5 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+                <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                <span className="flex-1">{poller?.lastError || poller?.error}</span>
+              </div>
+            )}
+          </div>
+
+          <p className="text-xs text-gray-400 text-center">{t('detail.run.pollerHint')}</p>
         </div>
       )}
     </div>
@@ -410,9 +939,7 @@ function SyslogSection({ workflowId }: { workflowId: string }) {
       </span>
     );
   } else {
-    summaryBadge = (
-      <span className="text-xs text-gray-400 font-normal">{t('detail.run.syslogExperimental')}</span>
-    );
+    summaryBadge = null;
   }
 
   useEffect(() => {
@@ -515,18 +1042,6 @@ function SyslogSection({ workflowId }: { workflowId: string }) {
       />
       {expanded && (
         <div className="p-4 space-y-4">
-          <div className="flex items-center gap-2">
-            <input
-              id={`syslog-enabled-${workflowId}`}
-              type="checkbox"
-              checked={enabled}
-              onChange={e => setEnabled(e.target.checked)}
-              className="rounded border-gray-300 text-red-600 focus:ring-red-500"
-            />
-            <label htmlFor={`syslog-enabled-${workflowId}`} className="text-xs text-gray-600">
-              {t('detail.run.syslogEnabled')}
-            </label>
-          </div>
           <div className="space-y-2">
             <p className="text-xs font-medium text-gray-600 flex items-center gap-1">
               <Server className="w-3.5 h-3.5" /> {t('detail.run.inputConfig')}
@@ -569,6 +1084,18 @@ function SyslogSection({ workflowId }: { workflowId: string }) {
               </select>
             </div>
             {inputField(t('detail.run.syslogInputKey'), inputKey, setInputKey, 'syslog_message')}
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg bg-gray-50 px-3 py-2">
+            <label htmlFor={`syslog-enabled-${workflowId}`} className="text-xs font-medium text-gray-600">
+              {t('detail.run.syslogEnabled')}
+            </label>
+            <input
+              id={`syslog-enabled-${workflowId}`}
+              type="checkbox"
+              checked={enabled}
+              onChange={e => setEnabled(e.target.checked)}
+              className="rounded border-gray-300 text-red-600 focus:ring-red-500"
+            />
           </div>
           <button
             type="button"
@@ -618,6 +1145,7 @@ export default function IntegrationTab({ workflow }: IntegrationTabProps) {
       <PublishSection workflowId={workflow.id} />
       <SyslogSection workflowId={workflow.id} />
       <KafkaSection workflowId={workflow.id} />
+      <PollerSection workflowId={workflow.id} />
     </div>
   );
 }

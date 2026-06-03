@@ -174,6 +174,61 @@ export interface SyslogListenerStatus {
   workerCount?: number;
 }
 
+export interface KafkaConfig {
+  workflowId?: string;
+  enabled?: boolean;
+  inputBroker?: string;
+  inputTopic?: string;
+  inputGroupId?: string;
+  inputKey?: string;
+  autoOffsetReset?: string;
+  inputs?: Record<string, any>;
+  updatedAt?: number;
+}
+
+/** Runtime state of the Kafka consumer (independent from saved config). */
+export interface KafkaConsumerStatus {
+  state: 'connecting' | 'running' | 'failed' | 'stopped';
+  error?: string | null;
+  broker?: string;
+  topic?: string;
+  groupId?: string;
+  queueSize?: number;
+  queueCapacity?: number;
+  workerCount?: number;
+}
+
+export interface WorkflowPollerConfig {
+  workflowId?: string;
+  enabled?: boolean;
+  intervalSeconds?: number;
+  timeoutSeconds?: number;
+  noOverlap?: boolean;
+  inputs?: Record<string, any>;
+  updatedAt?: number;
+}
+
+export interface WorkflowPollerStatus {
+  workflowId?: string;
+  state: 'running' | 'stopped' | 'failed';
+  error?: string | null;
+  enabled?: boolean;
+  intervalSeconds?: number;
+  timeoutSeconds?: number;
+  noOverlap?: boolean;
+  activeRuns?: number;
+  lastRunAt?: number | null;
+  lastRunId?: string | null;
+  lastStatus?: string | null;
+  lastError?: string | null;
+  lastDurationMs?: number | null;
+  selectedCount?: number | null;
+  processedMarkCount?: number | null;
+  channelNotifyStatus?: string | null;
+  kafkaMessageCount?: number | null;
+  nextRunAt?: number | null;
+}
+
 export const workflowAPI = {
   list: (params?: { category?: string; status?: string; excludeId?: string }) =>
     client.get<Workflow[]>('/api/workflow', { params }),
@@ -249,22 +304,41 @@ export const workflowAPI = {
     client.get<WorkflowService[]>('/api/workflow-services'),
 
   saveKafkaConfig: (id: string, config: {
+    enabled?: boolean;
     inputBroker?: string;
     inputTopic?: string;
     inputGroupId?: string;
-    outputBroker?: string;
-    outputTopic?: string;
+    inputKey?: string;
+    autoOffsetReset?: string;
+    inputs?: Record<string, any>;
   }) =>
-    client.post<{ ok: boolean }>(`/api/workflow/${id}/kafka-config`, config),
+    client.post<{ ok: boolean; consumer?: KafkaConsumerStatus }>(
+      `/api/workflow/${id}/kafka-config`,
+      config,
+    ),
 
   getKafkaConfig: (id: string) =>
-    client.get<{
-      inputBroker?: string;
-      inputTopic?: string;
-      inputGroupId?: string;
-      outputBroker?: string;
-      outputTopic?: string;
-    } | null>(`/api/workflow/${id}/kafka-config`),
+    client.get<KafkaConfig | null>(`/api/workflow/${id}/kafka-config`),
+
+  getKafkaStatus: (id: string) =>
+    client.get<KafkaConsumerStatus>(`/api/workflow/${id}/kafka-status`),
+
+  savePollerConfig: (id: string, config: WorkflowPollerConfig) =>
+    client.post<{ ok: boolean; status?: WorkflowPollerStatus }>(
+      `/api/workflow/${id}/poller-config`,
+      config,
+    ),
+
+  getPollerConfig: (id: string) =>
+    client.get<WorkflowPollerConfig | null>(`/api/workflow/${id}/poller-config`),
+
+  getPollerStatus: (id: string) =>
+    client.get<WorkflowPollerStatus>(`/api/workflow/${id}/poller-status`),
+
+  runPollerOnce: (id: string) =>
+    client.post<{ ok: boolean; status?: WorkflowPollerStatus }>(
+      `/api/workflow/${id}/poller-run-once`,
+    ),
 
   saveSyslogConfig: (id: string, config: {
     enabled?: boolean;

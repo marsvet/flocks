@@ -673,6 +673,24 @@ class InboundDispatcher:
                 f"命令 `{display_text or prompt_text}` 暂不支持在当前渠道中以 slash 形式执行。"
             )
 
+        async def _clear_history() -> None:
+            try:
+                from flocks.server.routes.session import _clear_session_history
+
+                deleted_count = await _clear_session_history(binding.session_id)
+            except Exception as exc:
+                log.error("dispatcher.clear_command_failed", {
+                    "session_id": binding.session_id,
+                    "channel_id": msg.channel_id,
+                    "error": str(exc),
+                })
+                await callbacks.deliver_text(f"清空当前会话失败：{type(exc).__name__}")
+                return
+
+            await callbacks.deliver_text(
+                f"已清空当前会话历史，共删除 {deleted_count} 条消息。"
+            )
+
         async def _run_session_control(_event, parsed) -> bool:
             if parsed.canonical_name == "status":
                 await self._handle_status_command(binding, msg, callbacks)
@@ -718,6 +736,7 @@ class InboundDispatcher:
                 direct_response=_publish_direct_response,
                 run_llm=_run_llm,
                 session_control=_run_session_control,
+                clear_history=_clear_history,
             ),
         )
         return True
@@ -848,6 +867,26 @@ class InboundDispatcher:
             agent_id=new_session.agent,
             scope_override=scope_override,
         )
+        # Archive the previous session so it no longer shows up as an *active*
+        # IM session. The binding has already moved to ``new_session`` via
+        # ``rebind`` above, but the old session retains ``status="active"`` and
+        # the same ``[Feishu]/[Wecom]/[Dingtalk]`` title prefix. Without this,
+        # repeated ``/new`` leaves multiple active sessions for the same
+        # conversation, and unattended scheduled tasks (which resolve the IM
+        # target via ``session_list(status="active")`` + title prefix) can no
+        # longer tell which one is current — sending to the wrong session or
+        # failing outright. Best-effort: archiving failure must not abort /new.
+        try:
+            await Session.update(
+                session.project_id,
+                session.id,
+                status="archived",
+            )
+        except Exception as exc:
+            log.warning("dispatcher.archive_previous_session_failed", {
+                "session_id": session.id,
+                "error": str(exc),
+            })
         await self._trigger_command_hook(
             "new",
             session.id,
