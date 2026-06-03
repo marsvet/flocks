@@ -41,7 +41,7 @@
   "smartAssistant": "智能AI助手",
   "agentPicker": {
     "title": "选择对话 Agent",
-    "hint": "默认使用此 Agent；输入 @Agent 可临时切换单条消息",
+    "hint": "新会话首条默认由 Rex 处理；输入 @Agent 可路由单条消息",
     "filter": {
       "all": "全部",
       "builtin": "内置",

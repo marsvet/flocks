@@ -24,6 +24,14 @@ import {
 
 const clientGetMock = vi.fn();
 const clientPostMock = vi.fn();
+const sessionApiListPromptQueueMock = vi.fn();
+const sessionApiEnqueuePromptMock = vi.fn();
+const sessionApiUpdateQueuedPromptMock = vi.fn();
+const sessionApiRemoveQueuedPromptMock = vi.fn();
+const sessionApiRunQueuedPromptNowMock = vi.fn();
+const sessionApiUpdateMessagePartMock = vi.fn();
+const sessionApiResendMessageMock = vi.fn();
+const sessionApiRegenerateMessageMock = vi.fn();
 const useSessionMessagesMock = vi.fn();
 const tMock = (key: string) => ({
   'chat.placeholder': '请输入消息',
@@ -92,6 +100,19 @@ vi.mock('@/api/client', () => ({
   getApiBase: () => '',
 }));
 
+vi.mock('@/api/session', () => ({
+  sessionApi: {
+    listPromptQueue: (...args: unknown[]) => sessionApiListPromptQueueMock(...args),
+    enqueuePrompt: (...args: unknown[]) => sessionApiEnqueuePromptMock(...args),
+    updateQueuedPrompt: (...args: unknown[]) => sessionApiUpdateQueuedPromptMock(...args),
+    removeQueuedPrompt: (...args: unknown[]) => sessionApiRemoveQueuedPromptMock(...args),
+    runQueuedPromptNow: (...args: unknown[]) => sessionApiRunQueuedPromptNowMock(...args),
+    updateMessagePart: (...args: unknown[]) => sessionApiUpdateMessagePartMock(...args),
+    resendMessage: (...args: unknown[]) => sessionApiResendMessageMock(...args),
+    regenerateMessage: (...args: unknown[]) => sessionApiRegenerateMessageMock(...args),
+  },
+}));
+
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
@@ -101,6 +122,14 @@ beforeEach(() => {
   });
   clientGetMock.mockResolvedValue({ data: {} });
   clientPostMock.mockResolvedValue({ data: {} });
+  sessionApiListPromptQueueMock.mockResolvedValue({ items: [] });
+  sessionApiEnqueuePromptMock.mockResolvedValue({});
+  sessionApiUpdateQueuedPromptMock.mockResolvedValue({});
+  sessionApiRemoveQueuedPromptMock.mockResolvedValue({});
+  sessionApiRunQueuedPromptNowMock.mockResolvedValue({});
+  sessionApiUpdateMessagePartMock.mockResolvedValue({});
+  sessionApiResendMessageMock.mockResolvedValue({});
+  sessionApiRegenerateMessageMock.mockResolvedValue({});
   pendingQuestionsHookMock.fetchPendingQuestions.mockResolvedValue(undefined);
   useSessionMessagesMock.mockReturnValue({
     messages: [],
@@ -365,6 +394,66 @@ describe('SessionChat agent mentions', () => {
         '/api/session/sess-1/prompt_async',
         expect.objectContaining({
           agent: 'explore',
+          parts: expect.any(Array),
+        }),
+      );
+    });
+  });
+
+  it('queues streaming messages to the mentioned agent', async () => {
+    const user = userEvent.setup();
+    render(React.createElement(SessionChat, {
+      sessionId: 'sess-1',
+      agentName: 'rex',
+      mentionAgents,
+      initialMessage: 'start streaming',
+    }));
+
+    await waitFor(() => {
+      expect(clientPostMock).toHaveBeenCalledWith(
+        '/api/session/sess-1/prompt_async',
+        expect.objectContaining({ parts: expect.any(Array) }),
+      );
+    });
+
+    sessionApiEnqueuePromptMock.mockClear();
+    await user.type(screen.getByRole('textbox'), '@explore queued message{enter}');
+
+    await waitFor(() => {
+      expect(sessionApiEnqueuePromptMock).toHaveBeenCalledWith(
+        'sess-1',
+        expect.objectContaining({
+          agent: 'explore',
+          parts: expect.any(Array),
+        }),
+      );
+    });
+  });
+
+  it('queues streaming messages to the default agent when no mention is provided', async () => {
+    const user = userEvent.setup();
+    render(React.createElement(SessionChat, {
+      sessionId: 'sess-1',
+      agentName: 'rex',
+      mentionAgents,
+      initialMessage: 'start streaming',
+    }));
+
+    await waitFor(() => {
+      expect(clientPostMock).toHaveBeenCalledWith(
+        '/api/session/sess-1/prompt_async',
+        expect.objectContaining({ parts: expect.any(Array) }),
+      );
+    });
+
+    sessionApiEnqueuePromptMock.mockClear();
+    await user.type(screen.getByRole('textbox'), 'queued message{enter}');
+
+    await waitFor(() => {
+      expect(sessionApiEnqueuePromptMock).toHaveBeenCalledWith(
+        'sess-1',
+        expect.objectContaining({
+          agent: 'rex',
           parts: expect.any(Array),
         }),
       );

@@ -1537,12 +1537,17 @@ export default function SessionChat({
     }
   };
 
-  const enqueueText = async (text: string, imageParts: ImagePartData[] = []) => {
+  const enqueueText = async (
+    text: string,
+    imageParts: ImagePartData[] = [],
+    agentOverride?: string,
+  ) => {
     if (!sessionId) return;
+    const effectiveAgent = agentOverride || agentName;
     try {
       await sessionApi.enqueuePrompt(sessionId, {
         parts: buildPromptParts(text, imageParts),
-        ...(agentName ? { agent: agentName } : {}),
+        ...(effectiveAgent ? { agent: effectiveAgent } : {}),
       });
       await fetchPromptQueue();
       setQueueExpanded(true);
@@ -1590,7 +1595,7 @@ export default function SessionChat({
 
     if (sessionId && isStreaming) {
       try {
-        await enqueueText(text, imageParts);
+        await enqueueText(text, imageParts, mentionedAgent || undefined);
         setAttachments([]);
       } catch {
         setInput(rawText);
