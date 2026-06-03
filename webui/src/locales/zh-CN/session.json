@@ -14,6 +14,12 @@
   "renameEmpty": "会话名称不能为空",
   "downloadJson": "下载 JSON",
   "downloadFailed": "下载失败",
+  "sharedTag": "已共享",
+  "shareAction": "本地共享",
+  "unshareAction": "取消共享",
+  "shareEnabled": "会话已共享给本地账号（只读）",
+  "shareDisabled": "已取消会话共享",
+  "shareUpdateFailed": "更新共享状态失败",
   "moreActions": "更多操作",
   "selectMode": "批量选择",
   "cancelSelect": "取消",
@@ -33,6 +39,20 @@
   "loading": "加载中...",
   "noAgents": "暂无可用的Agent",
   "smartAssistant": "智能AI助手",
+  "agentPicker": {
+    "title": "选择对话 Agent",
+    "hint": "默认使用此 Agent；输入 @Agent 可临时切换单条消息",
+    "filter": {
+      "all": "全部",
+      "builtin": "内置",
+      "custom": "自定义"
+    },
+    "badge": {
+      "primary": "主 Agent",
+      "builtin": "内置",
+      "custom": "自定义"
+    }
+  },
   "welcome": {
     "title": "开始新的对话",
     "description": "AI 原生的安全运营助手，帮您进行威胁分析、应急响应、安全编排等任务",
@@ -94,6 +114,11 @@
       "mergeFailed": "合并失败",
       "summarizeDone": "生成摘要 {{chars}} 字",
       "complete": "压缩完成"
+    },
+    "mention": {
+      "title": "选择 Agent",
+      "navigate": "导航",
+      "select": "选择"
     },
     "removeNodeRef": "移除节点引用",
     "errors": {
