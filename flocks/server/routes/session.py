@@ -22,6 +22,7 @@ from flocks.session.session import Session, SessionInfo as SessionModel
 from flocks.session.policy import SessionPolicy
 from flocks.utils.log import Log
 from flocks.utils.json_repair import parse_json_robust, repair_truncated_json
+from flocks.utils.monitor import get_monitor
 from flocks.server.auth import require_user
 
 router = APIRouter()
@@ -36,10 +37,6 @@ DEFAULT_AGENT = "rex"
 # extension (e.g. a PNG named report.pdf.exe whose tail would otherwise be
 # ".exe").
 _UPLOAD_SAFE_EXTS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "bmp", "pdf"})
-
-# Import monitor for metrics endpoint
-from flocks.utils.monitor import get_monitor
-
 
 # =============================================================================
 # Request/Response Models - API Compatible (camelCase)
@@ -98,8 +95,7 @@ class SessionResponse(BaseModel):
     """
     Session response - Flocks compatible
     
-    Matches Flocks Session.Info format exactly.
-    No agent/model/provider at top level - these come from messages.
+    Matches Flocks Session.Info format.
     """
     model_config = ConfigDict(populate_by_name=True, by_alias=True)
     
@@ -115,6 +111,9 @@ class SessionResponse(BaseModel):
     permission: Optional[List[Dict[str, Any]]] = Field(None, description="Permission rules")
     revert: Optional[Dict[str, Any]] = Field(None, description="Revert state")
     category: str = Field("user", description="Session category: user or task")
+    provider: Optional[str] = Field(None, description="Pinned provider ID")
+    model: Optional[str] = Field(None, description="Pinned model ID")
+    model_pinned: bool = Field(False, description="Whether provider/model are pinned for this session")
     ownerUserID: Optional[str] = Field(None, description="Session owner user id")
     ownerUsername: Optional[str] = Field(None, description="Session owner username")
     canWrite: bool = Field(False, description="Whether current user can continue this session")
@@ -125,9 +124,6 @@ class SessionResponse(BaseModel):
 def _session_to_response(session: SessionModel) -> SessionResponse:
     """
     Convert SessionModel to SessionResponse
-    
-    Note: agent/model/provider are NOT included at session level.
-    They are retrieved from the latest user message in the session.
     """
     current_user = get_current_auth_user()
     can_write = SessionPolicy.can_write(session, current_user)
@@ -152,6 +148,9 @@ def _session_to_response(session: SessionModel) -> SessionResponse:
         revert=session.revert.model_dump(by_alias=True) if session.revert else None,
         permission=[p.model_dump() for p in session.permission] if session.permission else None,
         category=session.category,
+        provider=session.provider,
+        model=session.model,
+        model_pinned=session.model_pinned,
         ownerUserID=session.owner_user_id,
         ownerUsername=session.owner_username,
         canWrite=can_write,
@@ -434,6 +433,7 @@ class TodoInfo(BaseModel):
     
     id: str = Field(..., description="Todo ID")
     content: str = Field(..., description="Task description")
+    activeForm: Optional[str] = Field(None, description="Active/progressive task description")
     status: str = Field(..., description="Status: pending, in_progress, completed, cancelled")
     priority: str = Field("medium", description="Priority: high, medium, low")
 
@@ -446,7 +446,7 @@ class TodoInfo(BaseModel):
 )
 async def get_session_todos(sessionID: str, request: Request) -> List[TodoInfo]:
     """Get session todos"""
-    from flocks.storage.storage import Storage
+    from flocks.session.features.todo import Todo
     _current_user = require_user(request)
     session = await _get_session_by_id_unfiltered(sessionID)
     if not session:
@@ -456,10 +456,8 @@ async def get_session_todos(sessionID: str, request: Request) -> List[TodoInfo]:
         )
     _require_session_read_access(session, _current_user)
     try:
-        todos = await Storage.read(["todo", sessionID])
-        if todos is None:
-            return []
-        return [TodoInfo(**todo) for todo in todos]
+        todos = await Todo.get(sessionID)
+        return [TodoInfo(**todo.model_dump(exclude_none=True)) for todo in todos]
     except Exception as e:
         log.warn("session.todo.read_error", {"sessionID": sessionID, "error": str(e)})
         return []
@@ -473,8 +471,7 @@ async def get_session_todos(sessionID: str, request: Request) -> List[TodoInfo]:
 )
 async def update_session_todos(sessionID: str, todos: List[TodoInfo], request: Request) -> List[TodoInfo]:
     """Update session todos"""
-    from flocks.storage.storage import Storage
-    from flocks.server.routes.event import publish_event
+    from flocks.session.features.todo import Todo, TodoInfo as SessionTodoInfo
     _current_user = require_user(request)
     session = await _get_session_by_id_unfiltered(sessionID)
     if not session:
@@ -484,13 +481,10 @@ async def update_session_todos(sessionID: str, todos: List[TodoInfo], request: R
         )
     _require_session_write_access(session, _current_user)
     try:
-        await Storage.write(["todo", sessionID], [t.model_dump() for t in todos])
-        
-        await publish_event("todo.updated", {
-            "sessionID": sessionID,
-            "todos": [t.model_dump() for t in todos],
-        })
-        
+        await Todo.update(
+            sessionID,
+            [SessionTodoInfo(**t.model_dump(exclude_none=True)) for t in todos],
+        )
         return todos
     except Exception as e:
         log.error("session.todo.write_error", {"sessionID": sessionID, "error": str(e)})
@@ -569,6 +563,9 @@ class SessionUpdateRequest(BaseModel):
     
     title: Optional[str] = Field(None, description="New title")
     time: Optional[Dict[str, Any]] = Field(None, description="Time updates (archived)")
+    provider: Optional[str] = Field(None, description="Pinned provider ID")
+    model: Optional[str] = Field(None, description="Pinned model ID")
+    model_pinned: Optional[bool] = Field(None, description="Whether provider/model are pinned for this session")
 
 
 @router.patch(
@@ -598,6 +595,12 @@ async def update_session(
         updates["title"] = request.title
     if request.time and request.time.get("archived") is not None:
         updates["archived"] = request.time["archived"]
+    if request.provider is not None:
+        updates["provider"] = request.provider
+    if request.model is not None:
+        updates["model"] = request.model
+    if request.model_pinned is not None:
+        updates["model_pinned"] = request.model_pinned
     
     session = await Session.update(
         project_id=existing.project_id,
@@ -1187,7 +1190,12 @@ async def get_session_messages(
     _require_session_read_access(session, current_user)
 
     try:
+        from flocks.session.orphan_tools import abort_orphan_running_parts_in_messages
+        from flocks.session.core.status import SessionStatus
+
         messages_with_parts = await Message.list_with_parts(sessionID, include_archived=True)
+        if sessionID not in SessionStatus.get_busy_session_ids():
+            await abort_orphan_running_parts_in_messages(sessionID, messages_with_parts)
         if limit:
             messages_with_parts = messages_with_parts[-limit:]
         
@@ -3365,7 +3373,7 @@ async def run_prompt_queue_item_now(sessionID: str, queueID: str) -> Dict[str, A
 async def send_session_message_async(
     sessionID: str,
     request: PromptRequest,
-    http_request: Request,
+    http_request: Request = None,
 ):
     """Send message asynchronously - returns 202 immediately, response via SSE"""
     import os
@@ -3379,8 +3387,9 @@ async def send_session_message_async(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {sessionID} not found"
         )
-    current_user = require_user(http_request)
-    _require_session_write_access(session, current_user)
+    if http_request is not None:
+        current_user = require_user(http_request)
+        _require_session_write_access(session, current_user)
     
     working_directory = session.directory or os.getcwd()
     
@@ -3454,7 +3463,7 @@ async def send_session_command(sessionID: str, request: CommandRequest, http_req
     Side-effecting direct commands like /clear run without creating a chat
     message and instead update session state via callbacks.
 
-    LLM-based commands (/plan, /ask, /init, /compact, ...) are routed through
+    LLM-based commands (/init, /compact, ...) are routed through
     the normal session-loop pipeline.
 
     In both cases the user message (showing the raw slash command text, e.g.
@@ -3847,5 +3856,3 @@ async def clear_session(sessionID: str, http_request: Request):
     except Exception as e:
         log.error("session.clear.error", {"sessionID": sessionID, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to clear session: {str(e)}")
-
-

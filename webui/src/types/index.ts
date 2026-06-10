@@ -17,6 +17,9 @@ export interface Session {
   revert?: SessionRevert;
   /** Session category: 'user' | 'workflow' | 'task' | 'entity-config' | ... */
   category?: string;
+  provider?: string;
+  model?: string;
+  model_pinned?: boolean;
   ownerUserID?: string;
   ownerUsername?: string;
   canWrite?: boolean;
@@ -263,6 +266,8 @@ export interface APIServiceMetadata {
   credential_schema?: APIServiceCredentialField[];
   verify_ssl?: boolean;
 }
+
+export type CustomDeviceAccessMode = 'api' | 'webcli' | 'workflow';
 
 export interface MCPServerConfig {
   type: 'stdio' | 'sse';

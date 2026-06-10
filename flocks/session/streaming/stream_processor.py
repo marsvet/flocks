@@ -96,6 +96,7 @@ class StreamProcessor:
         session_id: str,
         assistant_message: MessageInfo,
         agent: AgentInfo,
+        abort_event: Optional[asyncio.Event] = None,
         permission_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         text_delta_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         reasoning_delta_callback: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -112,6 +113,7 @@ class StreamProcessor:
         self.session_id = session_id
         self.assistant_message = assistant_message
         self.agent = agent
+        self.abort_event = abort_event or asyncio.Event()
         self.permission_callback = permission_callback
         self.text_delta_callback = text_delta_callback
         self.reasoning_delta_callback = reasoning_delta_callback
@@ -154,6 +156,12 @@ class StreamProcessor:
         
         # Flag: model emitted text-embedded tool calls (<tool_use> XML) that were extracted and executed
         self._text_tool_calls_executed = False
+
+        # Foreground subagents are long-running but independent. Start them as
+        # soon as their tool-call arrives so later sibling tool-calls in the same
+        # model response can launch too; the runner drains these before the step
+        # returns.
+        self._parallel_tool_tasks: Dict[str, asyncio.Task[None]] = {}
     
     async def process_event(self, event: StreamEvent) -> None:
         """
@@ -193,7 +201,10 @@ class StreamProcessor:
             pass  # Input is complete
         
         elif event_type == "tool-call":
-            await self._handle_tool_call(event)
+            if self._should_run_tool_call_parallel(event):
+                self._start_parallel_tool_call(event)
+            else:
+                await self._handle_tool_call(event)
         
         elif event_type == "text-start":
             await self._handle_text_start(event)
@@ -343,7 +354,7 @@ class StreamProcessor:
         """Handle reasoning block end"""
         if event.id in self.reasoning_parts:
             part = self.reasoning_parts[event.id]
-            part.text = part.text.rstrip()
+            part.text = part.text.strip()
             
             if event.metadata:
                 self._merge_reasoning_metadata(part, event.metadata)
@@ -652,6 +663,22 @@ class StreamProcessor:
                         import copy
 
                         _finished = [False]
+                        _pending_tasks: set[asyncio.Task[Any]] = set()
+
+                        def _track_task(coro: Awaitable[None]) -> None:
+                            task = asyncio.create_task(coro)
+                            _pending_tasks.add(task)
+
+                            def _cleanup(done_task: asyncio.Task[Any]) -> None:
+                                _pending_tasks.discard(done_task)
+                                try:
+                                    done_task.result()
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception as exc:
+                                    log.debug("stream.metadata_task.error", {"error": str(exc)})
+
+                            task.add_done_callback(_cleanup)
 
                         def _cb(metadata: Dict[str, Any]):
                             if _finished[0]:
@@ -667,6 +694,8 @@ class StreamProcessor:
                                 state_dict["title"] = snapshot["title"]
                             if self.event_publish_callback:
                                 async def _safe_publish():
+                                    if _finished[0]:
+                                        return
                                     try:
                                         await self.event_publish_callback(
                                             "message.part.updated",
@@ -682,9 +711,11 @@ class StreamProcessor:
                                                 }
                                             },
                                         )
+                                    except asyncio.CancelledError:
+                                        return
                                     except Exception as exc:
                                         log.debug("stream.metadata_publish.error", {"error": str(exc)})
-                                asyncio.create_task(_safe_publish())
+                                _track_task(_safe_publish())
 
                             # Persist updated running state so metadata (e.g. sessionId)
                             # survives page reload / session switch
@@ -713,11 +744,18 @@ class StreamProcessor:
                                         self.assistant_message.id,
                                         part,
                                     )
+                                except asyncio.CancelledError:
+                                    return
                                 except Exception as exc:
                                     log.debug("stream.metadata_persist.error", {"error": str(exc)})
-                            asyncio.create_task(_persist_running_metadata())
+                            _track_task(_persist_running_metadata())
 
-                        _cb.mark_finished = lambda: _finished.__setitem__(0, True)
+                        def _mark_finished() -> None:
+                            _finished[0] = True
+                            for task in list(_pending_tasks):
+                                task.cancel()
+
+                        _cb.mark_finished = _mark_finished
                         return _cb
 
                     ctx = ToolContext(
@@ -725,23 +763,25 @@ class StreamProcessor:
                         message_id=self.assistant_message.id,
                         agent=self.agent.name,
                         call_id=tool_call_id,
+                        abort_event=self.abort_event,
                         permission_callback=self.permission_callback,
                         extra=sandbox_meta["extra"],
                         metadata_callback=_make_metadata_cb(),
                         event_publish_callback=self.event_publish_callback,
                     )
-                    
-                    result = await ToolRegistry.execute(
-                        tool_name=tool_name,
-                        ctx=ctx,
-                        **tool_input
-                    )
-
-                    # Mark metadata callback as finished so pending async persist
-                    # tasks won't overwrite the upcoming completed/error state
                     cb = ctx._metadata_callback
-                    if cb and hasattr(cb, 'mark_finished'):
-                        cb.mark_finished()
+                    try:
+                        result = await ToolRegistry.execute(
+                            tool_name=tool_name,
+                            ctx=ctx,
+                            **tool_input
+                        )
+                    finally:
+                        # Mark metadata callback as finished so pending async
+                        # running-state updates cannot overwrite completed,
+                        # errored, or interrupted tool state.
+                        if cb and hasattr(cb, 'mark_finished'):
+                            cb.mark_finished()
 
             # Hook pipeline: tool.execute.after
             try:
@@ -867,6 +907,67 @@ class StreamProcessor:
                 except Exception as e:
                     log.error("stream.tool_end_callback.error", {"error": str(e)})
             
+        except asyncio.CancelledError:
+            interrupt_msg = "Tool execution was interrupted"
+            log.info("stream.tool_call.cancelled", {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+            })
+            try:
+                if tool_span_ctx is not None:
+                    tool_span_ctx.end(
+                        output=interrupt_msg,
+                        metadata={"success": False},
+                        level="ERROR",
+                        status_message="tool_cancelled",
+                    )
+            except Exception as _span_err:
+                log.debug("stream.tool_span.cancel_end_failed", {"error": str(_span_err)})
+
+            tool_state.status = "error"
+            tool_state.error = interrupt_msg
+
+            try:
+                tool_end_time = int(datetime.now().timestamp() * 1000)
+                error_state = ToolStateError(
+                    status="error",
+                    input=tool_input,
+                    error=interrupt_msg,
+                    time={"start": tool_start_time if 'tool_start_time' in locals() else tool_end_time, "end": tool_end_time},
+                )
+
+                error_part = ToolPart(
+                    id=tool_state.part_id,
+                    sessionID=self.session_id,
+                    messageID=self.assistant_message.id,
+                    type="tool",
+                    callID=tool_call_id,
+                    tool=tool_name,
+                    state=error_state,
+                )
+                await Message.store_part(self.session_id, self.assistant_message.id, error_part)
+
+                if self.event_publish_callback:
+                    await self.event_publish_callback("message.part.updated", {
+                        "part": {
+                            "id": tool_state.part_id,
+                            "messageID": self.assistant_message.id,
+                            "sessionID": self.session_id,
+                            "type": "tool",
+                            "callID": tool_call_id,
+                            "tool": tool_name,
+                            "state": {
+                                "status": "error",
+                                "input": tool_input,
+                                "error": interrupt_msg,
+                                "time": {"start": tool_start_time if 'tool_start_time' in locals() else tool_end_time, "end": tool_end_time},
+                            }
+                        }
+                    })
+            except Exception as store_e:
+                log.error("stream.tool_call.cancelled_update_failed", {"error": str(store_e)})
+
+            raise
         except Exception as e:
             log.error("stream.tool_call.error", {
                 "tool_call_id": tool_call_id,
@@ -1200,7 +1301,7 @@ class StreamProcessor:
                     "session_id": self.session_id,
                     "reason": "found XML tool-call markup but could not parse any valid tool calls",
                 })
-            
+
             # Update time
             if self.current_text_part.time:
                 self.current_text_part.time.end = int(datetime.now().timestamp() * 1000)
@@ -1226,6 +1327,50 @@ class StreamProcessor:
             })
             
             self.current_text_part = None
+
+    def _should_run_tool_call_parallel(self, event: ToolCallEvent) -> bool:
+        """Return true for independent foreground subagent tool-calls."""
+        if event.tool_name not in {"delegate_task", "task"}:
+            return False
+        tool_input = event.input if isinstance(event.input, dict) else {}
+        if tool_input.get("run_in_background") is True:
+            return False
+        return bool(
+            tool_input.get("subagent_type")
+            or tool_input.get("category")
+            or tool_input.get("session_id")
+        )
+
+    def _start_parallel_tool_call(self, event: ToolCallEvent) -> None:
+        if event.tool_call_id in self._parallel_tool_tasks:
+            return
+
+        async def _run() -> None:
+            await self._handle_tool_call(event)
+
+        task = asyncio.create_task(_run(), name=f"tool:{event.tool_name}:{event.tool_call_id}")
+        self._parallel_tool_tasks[event.tool_call_id] = task
+
+        def _cleanup(done_task: asyncio.Task[None]) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.error("stream.parallel_tool_call.error", {
+                    "tool_call_id": event.tool_call_id,
+                    "tool_name": event.tool_name,
+                    "error": str(exc),
+                })
+
+        task.add_done_callback(_cleanup)
+
+    async def drain_parallel_tool_calls(self) -> None:
+        """Wait for foreground parallel tool-calls before returning the step."""
+        if not self._parallel_tool_tasks:
+            return
+        tasks = list(self._parallel_tool_tasks.values())
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _compute_visible_delta(previous: str, current: str) -> str:

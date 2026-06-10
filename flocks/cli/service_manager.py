@@ -26,7 +26,6 @@ from typing import Iterable, Sequence
 import httpx
 
 from flocks.browser.admin import stop_all_daemons as stop_all_browser_daemons
-from flocks.utils.log import rotate_log_file
 
 try:
     import fcntl
@@ -799,11 +798,10 @@ def _port_owner_lookup_available() -> bool:
 
 
 def _bind_port_available(port: int) -> bool:
-    """Return True when the TCP port can be bound locally."""
+    """Return True when the TCP port can be bound on any local IPv4 interface."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind(("127.0.0.1", port))
+            sock.bind(("0.0.0.0", port))
         except OSError:
             return False
     return True
@@ -1682,7 +1680,6 @@ def _spawn_process(
         kwargs["start_new_session"] = True
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    rotate_log_file(log_path)
     handle = log_path.open("a", encoding="utf-8")
     try:
         return subprocess.Popen(
