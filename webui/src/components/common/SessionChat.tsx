@@ -1,23 +1,23 @@
 /**
- * SessionChat — 统一的 Agent Session 对话组件
+ * SessionChat — shared Agent Session conversation component.
  *
- * 产品中所有需要 AI 对话能力的地方都应使用此组件：
- * - Session 会话主页面 (compact=false)
- * - 工作流编辑对话面板
- * - 任务执行详情面板
- * - ChatDialog 弹窗
- * - EntitySheet Rex 对话 Tab
+ * Use this component anywhere the product needs an AI conversation surface:
+ * - Main Session page (compact=false)
+ * - Workflow edit chat panel
+ * - Task execution detail panel
+ * - ChatDialog modal
+ * - EntitySheet Rex chat tab
  *
- * 功能：
- * - 加载并展示指定 session 的完整对话消息
- * - SSE 实时流式更新
- * - 渲染 text / reasoning / tool 三种 part 类型
- * - 底部追问输入框（可通过 hideInput 隐藏）
- * - 消息复制、时间戳等可选功能
+ * Capabilities:
+ * - Load and render the complete conversation for a session
+ * - Stream live updates over SSE
+ * - Render text, reasoning, and tool parts
+ * - Provide a follow-up composer that can be hidden with hideInput
+ * - Support optional copy actions, timestamps, and related affordances
  */
 
-import { useState, useCallback, useRef, useEffect, useMemo, memo } from 'react';
-import { Send, Loader2, ChevronDown, Square, Copy, User, FileText, AlertCircle, X, RefreshCw, Pencil, Save, ImageIcon, Paperclip, ArrowUp, Clock, CheckCircle2, XCircle, Brain, Trash2, Bot } from 'lucide-react';
+import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, memo } from 'react';
+import { Send, Loader2, ChevronDown, Square, Copy, User, FileText, AlertCircle, X, RefreshCw, Pencil, Save, ImageIcon, Paperclip, ArrowUp, Clock, CheckCircle2, XCircle, Brain, Trash2, Bot, Check, ListTree } from 'lucide-react';
 import { StreamingMarkdown } from './StreamingMarkdown';
 import { useTranslation } from 'react-i18next';
 import LoadingSpinner from './LoadingSpinner';
@@ -29,7 +29,7 @@ import { useSessionMessages } from '@/hooks/useSessions';
 import { useSSE, type SSEConnectionStatus } from '@/hooks/useSSE';
 import { useReasoningToggle } from '@/hooks/useReasoningToggle';
 import { usePendingQuestions, type PendingQuestion } from '@/hooks/usePendingQuestions';
-import { sessionApi, type QueuedPrompt } from '@/api/session';
+import { sessionApi, type ContextUsageSnapshot, type QueuedPrompt } from '@/api/session';
 import client, { getApiBase } from '@/api/client';
 import { commandAPI, type Command } from '@/api/skill';
 import type { Agent } from '@/api/agent';
@@ -48,7 +48,7 @@ import {
   readFileAsDataUrl,
   type ImagePartData,
 } from '@/utils/imageUpload';
-import type { Message, MessagePart, ToolState } from '@/types';
+import type { Message, MessagePart, SessionGoalState, ToolState } from '@/types';
 
 export { formatSmartTime };
 export type { SSEConnectionStatus };
@@ -71,13 +71,45 @@ export interface NodeRef {
   description?: string;
 }
 
+type GoalBannerStatus = 'active' | 'completed' | 'blocked' | 'paused';
+
+interface GoalBannerState {
+  objective: string;
+  status: GoalBannerStatus;
+  reason?: string;
+}
+
 export interface ConversationBottomSlotActions {
-  sendPrompt: (text: string) => void;
+  sendPrompt: (text: string, options?: PromptDisplayOptions) => void;
   setInput: (text: string) => void;
   focusInput: () => void;
   sending: boolean;
   streaming: boolean;
   sessionId?: string | null;
+  hasMessages: boolean;
+}
+
+export interface PromptDisplayOptions {
+  displayText?: string;
+}
+
+const INSTRUCTION_DISPLAY_PREFIX = '@@flocks-instruction:';
+
+export function buildInstructionDisplayText(label: string): string {
+  return `${INSTRUCTION_DISPLAY_PREFIX}${label}`;
+}
+
+export function parseInstructionDisplayText(text: string): string | null {
+  return text.startsWith(INSTRUCTION_DISPLAY_PREFIX)
+    ? text.slice(INSTRUCTION_DISPLAY_PREFIX.length).trim() || null
+    : null;
+}
+
+function getMessagePartDisplayText(part: MessagePart): string {
+  const metadataDisplayText = part.metadata?.displayText ?? part.metadata?.display_text;
+  return typeof metadataDisplayText === 'string' && metadataDisplayText
+    ? metadataDisplayText
+    : part.text || '';
 }
 
 /** Display-related options grouped to reduce prop surface. */
@@ -90,6 +122,10 @@ export interface SessionChatDisplay {
   showActions?: boolean;
   /** Show timestamp below each message */
   showTimestamp?: boolean;
+  /** Default-collapse intermediate reasoning and tool-process details in embedded panels. */
+  collapseIntermediateSteps?: boolean;
+  /** Initial open state for grouped reasoning/tool-process details. */
+  processGroupsDefaultOpen?: boolean;
 }
 
 export interface SessionChatProps {
@@ -163,6 +199,7 @@ export interface SessionChatProps {
     imageParts?: ImagePartData[],
     agentOverride?: string,
     modelOverride?: { providerID: string; modelID: string } | null,
+    options?: PromptDisplayOptions,
   ) => Promise<unknown> | unknown;
   /** Called when the user sends "/new" to create a new session */
   onCreateNewSession?: () => Promise<void> | void;
@@ -203,6 +240,15 @@ function countTokensLikeCompaction(text: string | null | undefined): number {
   return Math.floor(text.length / APPROX_CHARS_PER_TOKEN);
 }
 
+const INSIGNIFICANT_THINKING_TEXT_RE = /^[\p{P}\p{S}]+$/u;
+
+export function getRenderableThinkingText(part: Pick<MessagePart, 'type' | 'text' | 'thinking'>): string {
+  if (part.type !== 'reasoning' && part.type !== 'thinking') return '';
+  const text = (part.text || part.thinking || '').trim();
+  if (!text || INSIGNIFICANT_THINKING_TEXT_RE.test(text)) return '';
+  return text;
+}
+
 function stringifyToolPayload(value: unknown): string {
   if (value == null) return '';
   if (typeof value === 'string') return value;
@@ -217,7 +263,7 @@ function estimatePartTokens(part: MessagePart): number {
   if (part.type === 'text') {
     return countTokensLikeCompaction(part.text);
   }
-  if (part.type === 'reasoning') {
+  if (part.type === 'reasoning' || part.type === 'thinking') {
     return countTokensLikeCompaction(part.text);
   }
   if (part.type === 'tool' && part.state) {
@@ -231,11 +277,203 @@ function estimatePartTokens(part: MessagePart): number {
   return 0;
 }
 
-function estimateContextTokens(messages: Message[], draft: string): number {
-  const messageTokens = messages.reduce((total, message) => (
-    total + message.parts.reduce((sum, part) => sum + estimatePartTokens(part), 0)
+export interface ContextUsageBreakdownSegment {
+  key:
+    | 'systemPrompt'
+    | 'toolDefinitions'
+    | 'tools'
+    | 'skillLoad'
+    | 'agentDelegation'
+    | 'conversation'
+    | 'reasoning'
+    | 'draft'
+    | 'compactedHistory';
+  tokens: number;
+  colorClass: string;
+  included: boolean;
+}
+
+export interface ContextUsageBreakdown {
+  usedTokens: number;
+  compactedTokens: number;
+  segments: ContextUsageBreakdownSegment[];
+  excludedSegments: ContextUsageBreakdownSegment[];
+}
+
+const CONTEXT_SEGMENT_COLORS: Record<ContextUsageBreakdownSegment['key'], string> = {
+  systemPrompt: 'bg-zinc-400',
+  toolDefinitions: 'bg-violet-400',
+  tools: 'bg-indigo-400',
+  skillLoad: 'bg-amber-400',
+  agentDelegation: 'bg-emerald-500',
+  conversation: 'bg-slate-500',
+  reasoning: 'bg-rose-400',
+  draft: 'bg-sky-400',
+  compactedHistory: 'bg-zinc-300',
+};
+
+const CONTEXT_SEGMENT_KEYS = new Set(Object.keys(CONTEXT_SEGMENT_COLORS));
+const CONTEXT_USAGE_FIXED_SEGMENT_KEYS = [
+  'systemPrompt',
+  'toolDefinitions',
+  'conversation',
+  'reasoning',
+  'tools',
+  'skillLoad',
+  'agentDelegation',
+] as const satisfies readonly ContextUsageBreakdownSegment['key'][];
+const CONTEXT_USAGE_FIXED_SEGMENT_KEY_SET = new Set<ContextUsageBreakdownSegment['key']>(
+  CONTEXT_USAGE_FIXED_SEGMENT_KEYS,
+);
+
+function estimateMessageTokens(message: Message): number {
+  return message.parts.reduce((sum, part) => sum + estimatePartTokens(part), 0);
+}
+
+function estimateActiveMessageBreakdown(messages: Message[]): Pick<ContextUsageBreakdown, 'segments' | 'usedTokens'> {
+  let conversationTokens = 0;
+  let reasoningTokens = 0;
+
+  messages.forEach((message) => {
+    if (message.compacted) return;
+    message.parts.forEach((part) => {
+      const tokens = estimatePartTokens(part);
+      if (part.type === 'reasoning' || part.type === 'thinking') {
+        reasoningTokens += tokens;
+      } else {
+        conversationTokens += tokens;
+      }
+    });
+  });
+
+  const segments: ContextUsageBreakdownSegment[] = [];
+  if (conversationTokens > 0) {
+    segments.push({
+      key: 'conversation',
+      tokens: conversationTokens,
+      colorClass: CONTEXT_SEGMENT_COLORS.conversation,
+      included: true,
+    });
+  }
+  if (reasoningTokens > 0) {
+    segments.push({
+      key: 'reasoning',
+      tokens: reasoningTokens,
+      colorClass: CONTEXT_SEGMENT_COLORS.reasoning,
+      included: true,
+    });
+  }
+
+  return {
+    usedTokens: conversationTokens + reasoningTokens,
+    segments,
+  };
+}
+
+function normalizeContextSegment(segment: {
+  key: string;
+  tokens: number;
+  included?: boolean;
+}): ContextUsageBreakdownSegment | null {
+  const rawKey = segment.key === 'otherContext' ? 'conversation' : segment.key;
+  if (!CONTEXT_SEGMENT_KEYS.has(rawKey)) {
+    return null;
+  }
+  const key = rawKey as ContextUsageBreakdownSegment['key'];
+  return {
+    key,
+    tokens: Math.max(0, Math.round(segment.tokens || 0)),
+    colorClass: CONTEXT_SEGMENT_COLORS[key],
+    included: segment.included !== false,
+  };
+}
+
+function addContextSegmentTokens(
+  segments: ContextUsageBreakdownSegment[],
+  key: ContextUsageBreakdownSegment['key'],
+  tokens: number,
+): void {
+  if (tokens <= 0) return;
+  const existing = segments.find((segment) => segment.key === key);
+  if (existing) {
+    existing.tokens += tokens;
+    return;
+  }
+  segments.push({
+    key,
+    tokens,
+    colorClass: CONTEXT_SEGMENT_COLORS[key],
+    included: true,
+  });
+}
+
+function normalizeFixedContextSegments(
+  segments: ContextUsageBreakdownSegment[],
+): ContextUsageBreakdownSegment[] {
+  const byKey = new Map<ContextUsageBreakdownSegment['key'], ContextUsageBreakdownSegment>();
+  for (const segment of segments) {
+    if (!CONTEXT_USAGE_FIXED_SEGMENT_KEY_SET.has(segment.key)) {
+      continue;
+    }
+    const existing = byKey.get(segment.key);
+    if (existing) {
+      existing.tokens += segment.tokens;
+    } else {
+      byKey.set(segment.key, { ...segment, included: true });
+    }
+  }
+
+  return CONTEXT_USAGE_FIXED_SEGMENT_KEYS.map((key) => {
+    const segment = byKey.get(key);
+    if (segment) {
+      return segment;
+    }
+    return {
+      key,
+      tokens: 0,
+      colorClass: CONTEXT_SEGMENT_COLORS[key],
+      included: true,
+    };
+  });
+}
+
+export function buildContextUsageBreakdown(
+  messages: Message[],
+  draft: string,
+  snapshot?: ContextUsageSnapshot | null,
+): ContextUsageBreakdown {
+  const compactedTokens = messages.reduce((total, message) => (
+    message.compacted ? total + estimateMessageTokens(message) : total
   ), 0);
-  return messageTokens + countTokensLikeCompaction(draft);
+  const draftTokens = countTokensLikeCompaction(draft);
+
+  if (snapshot) {
+    const serverSegments = (snapshot.segments || [])
+      .map(normalizeContextSegment)
+      .filter((segment): segment is ContextUsageBreakdownSegment => Boolean(segment));
+    const segments = [...serverSegments];
+
+    addContextSegmentTokens(segments, 'conversation', draftTokens);
+
+    return {
+      usedTokens: Math.max(0, snapshot.usedTokens || 0) + draftTokens,
+      compactedTokens: Math.max(0, snapshot.compactedTokens || 0),
+      segments: normalizeFixedContextSegments(segments),
+      excludedSegments: [],
+    };
+  }
+
+  const activeBreakdown = estimateActiveMessageBreakdown(messages);
+  const segments: ContextUsageBreakdownSegment[] = [...activeBreakdown.segments];
+
+  addContextSegmentTokens(segments, 'conversation', draftTokens);
+
+  return {
+    usedTokens: activeBreakdown.usedTokens + draftTokens,
+    compactedTokens,
+    segments: normalizeFixedContextSegments(segments),
+    excludedSegments: [],
+  };
 }
 
 function formatTokenCount(tokens: number): string {
@@ -244,9 +482,44 @@ function formatTokenCount(tokens: number): string {
   return String(tokens);
 }
 
-function ContextUsageRing({ percent, title }: { percent: number; title: string }) {
+function getContextUsageLabel(
+  t: ReturnType<typeof useTranslation>['t'],
+  key: ContextUsageBreakdownSegment['key'],
+): string {
+  const fallback: Record<ContextUsageBreakdownSegment['key'], string> = {
+    systemPrompt: 'System prompt',
+    toolDefinitions: 'Tool definitions',
+    tools: 'Tool calls',
+    skillLoad: 'Skill loads',
+    agentDelegation: 'Agent delegation',
+    conversation: 'Conversation',
+    reasoning: 'Reasoning',
+    draft: 'Current draft',
+    compactedHistory: 'Compacted history',
+  };
+  const i18nKey = `chat.contextUsage.breakdown.${key}`;
+  const label = t(i18nKey);
+  return label === i18nKey ? fallback[key] : label;
+}
+
+function ContextUsageRing({
+  percent,
+  title,
+  usedTokens,
+  totalTokens,
+  breakdown,
+}: {
+  percent: number;
+  title: string;
+  usedTokens: number;
+  totalTokens: number;
+  breakdown: ContextUsageBreakdown;
+}) {
+  const { t } = useTranslation('session');
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const clamped = Math.max(0, Math.min(100, percent));
-  const radius = 13;
+  const radius = 9;
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference * (1 - clamped / 100);
   const strokeClass = clamped >= 90
@@ -256,27 +529,124 @@ function ContextUsageRing({ percent, title }: { percent: number; title: string }
       : clamped >= 50
         ? 'stroke-sky-500'
         : 'stroke-zinc-400';
+  const rows = breakdown.segments;
+  const activeSegments = breakdown.segments.filter((segment) => segment.tokens > 0);
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!wrapperRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
 
   return (
     <div
-      className="relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full"
-      title={title}
-      aria-label={title}
+      ref={wrapperRef}
+      className="relative inline-flex h-6 w-6 shrink-0 items-center justify-center"
     >
-      <svg className="absolute inset-0 h-8 w-8 -rotate-90" viewBox="0 0 32 32" aria-hidden="true">
-        <circle cx="16" cy="16" r={radius} fill="none" strokeWidth="2.5" className="stroke-zinc-200" />
-        <circle
-          cx="16"
-          cy="16"
-          r={radius}
-          fill="none"
-          strokeWidth="2.5"
-          strokeLinecap="round"
-          className={strokeClass}
-          strokeDasharray={circumference}
-          strokeDashoffset={strokeDashoffset}
-        />
-      </svg>
+      <button
+        type="button"
+        className="relative inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors hover:bg-zinc-200/60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-500"
+        title={title}
+        aria-label={title}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <svg className="absolute inset-0 h-6 w-6 -rotate-90" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r={radius} fill="none" strokeWidth="2" className="stroke-zinc-200 dark:stroke-zinc-800" />
+          <circle
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            strokeWidth="2"
+            strokeLinecap="round"
+            className={strokeClass}
+            strokeDasharray={circumference}
+            strokeDashoffset={strokeDashoffset}
+          />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label={t('chat.contextUsage.title')}
+          className="absolute bottom-full right-0 z-50 mb-2 w-80 max-w-[calc(100vw-2rem)] rounded-lg border border-zinc-200 bg-white text-zinc-800 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:shadow-xl dark:shadow-black/30"
+        >
+          <div className="border-b border-zinc-100 px-2.5 py-1.5 dark:border-zinc-800">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-xs font-semibold text-zinc-700 dark:text-zinc-100">{t('chat.contextUsage.title')}</div>
+                <div className="truncate text-[10px] text-zinc-400 dark:text-zinc-500">
+                  {t('chat.contextUsage.tokens', {
+                    used: formatTokenCount(usedTokens),
+                    total: formatTokenCount(totalTokens),
+                  })}
+                </div>
+              </div>
+              <span className="shrink-0 rounded bg-zinc-50 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-300">
+                {t('chat.contextUsage.full', { percent: clamped })}
+              </span>
+            </div>
+            <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+              <div
+                className="flex h-full overflow-hidden rounded-full"
+                style={{ width: `${clamped}%` }}
+              >
+                {activeSegments.map((segment) => (
+                  <div
+                    key={segment.key}
+                    className={segment.colorClass}
+                    style={{
+                      flex: '0 0 auto',
+                      width: `${Math.min(100, (segment.tokens / Math.max(1, usedTokens)) * 100)}%`,
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="max-h-[13.5rem] space-y-0.5 overflow-y-auto p-1.5">
+            {rows.map((segment) => (
+              <div
+                key={segment.key}
+                role="menuitem"
+                className="flex min-w-0 items-center justify-between gap-3 rounded-md px-2 py-1.5 text-xs text-zinc-700 dark:text-zinc-300"
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className={`h-3 w-3 shrink-0 rounded-[3px] ${segment.colorClass}`} />
+                  <span className="truncate font-medium text-zinc-800 dark:text-zinc-100">
+                    {getContextUsageLabel(t, segment.key)}
+                  </span>
+                </div>
+                <span className={segment.included ? 'shrink-0 text-zinc-600 dark:text-zinc-300' : 'shrink-0 text-zinc-400 dark:text-zinc-500'}>
+                  {segment.included
+                    ? formatTokenCount(segment.tokens)
+                    : t('chat.contextUsage.excludedTokens', { tokens: formatTokenCount(segment.tokens) })}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -459,10 +829,14 @@ export function getMessageBubbleClassName({
   isEditing: boolean;
 }): string {
   if (compact) {
-    return `max-w-[90%] px-4 py-3 rounded-[20px] text-sm break-words shadow-sm ${
+    const widthClass = isUser
+      ? (isEditing ? 'w-full max-w-full' : 'max-w-full')
+      : 'w-full max-w-full';
+
+    return `${widthClass} px-4 py-3 rounded-[20px] text-sm break-words shadow-sm ${
       isUser
-        ? 'bg-sky-50 border border-sky-100 text-zinc-900'
-        : 'bg-white border border-zinc-200/90'
+        ? 'bg-sky-50 border border-sky-100 text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-50 dark:shadow-none'
+        : 'bg-white border border-zinc-200/90 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:shadow-none'
     }`;
   }
 
@@ -472,9 +846,13 @@ export function getMessageBubbleClassName({
 
   return `${widthClass} px-5 py-4 rounded-[24px] text-sm break-words shadow-sm ${
     isUser
-      ? 'bg-sky-50 border border-sky-100 text-zinc-900'
-      : 'bg-white border border-zinc-200/90'
+      ? 'bg-sky-50 border border-sky-100 text-zinc-900 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-50 dark:shadow-none'
+      : 'bg-white border border-zinc-200/90 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100 dark:shadow-none'
   }`;
+}
+
+export function getInstructionDisplayBubbleClassName(compact: boolean): string {
+  return `${compact ? 'px-2.5 py-1.5' : 'px-3 py-2'} rounded-lg border border-rose-100 bg-rose-50/80 text-sm text-rose-700 shadow-none dark:border-rose-500/30 dark:bg-rose-950/30 dark:text-rose-200`;
 }
 
 export function getMessageGroupClassName({
@@ -487,14 +865,19 @@ export function getMessageGroupClassName({
   isEditing: boolean;
 }): string {
   if (!isUser) {
-    return compact ? 'max-w-[90%]' : 'w-full';
+    return compact ? 'w-full max-w-full' : 'w-full';
   }
 
   if (compact) {
     return isEditing ? 'w-full max-w-[90%]' : 'w-fit max-w-[90%]';
   }
 
-  return isEditing ? 'w-[80%] max-w-[80%]' : 'w-fit max-w-[80%]';
+  return isEditing ? 'w-full max-w-full' : 'w-fit max-w-[88%]';
+}
+
+export function getCompactionDividerClassName(compact: boolean): string {
+  const messageInset = compact ? 'pl-[38px]' : 'pl-[42px]';
+  return `${compact ? 'my-3' : 'my-4'} flex w-full min-w-0 items-center gap-3 ${messageInset} pr-1 text-xs text-zinc-500`;
 }
 
 export function getRegenerateTruncateTarget(
@@ -518,6 +901,21 @@ export function shouldRefetchFinishedMessage({
   return !finishedMessageId || !abortedMessageId || finishedMessageId !== abortedMessageId;
 }
 
+export function isActiveToolPart(part?: Pick<MessagePart, 'type' | 'state'> | null): boolean {
+  return (
+    (part?.type === 'tool' || part?.type === 'toolCall') &&
+    (part.state?.status === 'pending' || part.state?.status === 'running')
+  );
+}
+
+export function hasActiveToolPart(parts?: Array<Pick<MessagePart, 'type' | 'state'>> | null): boolean {
+  return parts?.some(isActiveToolPart) ?? false;
+}
+
+export function isActiveSessionStatus(status?: { type?: string } | null): boolean {
+  return status?.type === 'busy' || status?.type === 'compacting' || status?.type === 'retry';
+}
+
 export function getEditingActionBarClassName(): string {
   return 'mt-3 flex w-full items-center justify-end gap-1.5';
 }
@@ -533,7 +931,12 @@ export function getRenderableFileUrl(url: string): string {
 
   try {
     const parsed = new URL(url);
-    const path = decodeURIComponent(parsed.pathname);
+    let path = decodeURIComponent(parsed.pathname);
+    if (/^\/[A-Za-z]:\//.test(path)) {
+      path = path.slice(1);
+    } else if (parsed.hostname) {
+      path = `//${parsed.hostname}${path}`;
+    }
     return `${getApiBase()}/api/file/download?path=${encodeURIComponent(path)}`;
   } catch {
     return url;
@@ -549,17 +952,46 @@ export function shouldRenderMessage(message: Pick<Message, 'role' | 'parts' | 'f
   ) {
     return false;
   }
+  if (
+    message.role === 'assistant' &&
+    message.finish === 'stop' &&
+    !message.error &&
+    message.parts?.length &&
+    message.parts.every((part) => {
+      if (part.type === 'text') return !(part.text || '').trim();
+      if (part.type === 'reasoning' || part.type === 'thinking') return !getRenderableThinkingText(part);
+      return false;
+    })
+  ) {
+    return false;
+  }
   return true;
 }
 
+export function getMessageErrorText(message: Pick<Message, 'error'>): string {
+  const error = message.error as any;
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  if (typeof error.data?.displayMessage === 'string' && error.data.displayMessage.trim()) {
+    return error.data.displayMessage;
+  }
+  if (typeof error.message === 'string' && error.message.trim()) return error.message;
+  if (typeof error.data?.message === 'string' && error.data.message.trim()) {
+    return error.data.message;
+  }
+  if (typeof error.code === 'string' && error.code.trim()) return error.code;
+  if (typeof error.name === 'string' && error.name.trim()) return error.name;
+  return 'Message failed';
+}
+
 export function getUserAvatarContainerClassName(compact: boolean): string {
-  return `pointer-events-none absolute left-full top-0 ml-2.5 translate-y-1/2 flex items-center justify-end ${
+  return `pointer-events-none flex flex-shrink-0 items-start justify-center pt-1 ${
     compact ? 'h-7' : 'h-8'
   }`;
 }
 
-export function getUserAvatarSpacerClassName(compact: boolean): string {
-  return compact ? 'h-3.5' : 'h-4';
+export function getUserAvatarSpacerClassName(_compact: boolean): string {
+  return 'h-0';
 }
 
 function areToolStatesRenderEqual(
@@ -659,8 +1091,135 @@ function isAllowedUploadFile(file: File): boolean {
 }
 
 function getQueuedPromptText(item: QueuedPrompt): string {
+  if (typeof item.displayText === 'string' && item.displayText) return item.displayText;
+  if (typeof item.display_text === 'string' && item.display_text) return item.display_text;
   const textPart = item.parts.find((part) => part.type === 'text' && typeof part.text === 'string');
   return typeof textPart?.text === 'string' ? textPart.text : '';
+}
+
+function getGoalBannerKey(goal: GoalBannerState | null): string {
+  return goal ? `${goal.status}:${goal.objective}` : '';
+}
+
+function getDismissedGoalStorageKey(sessionId?: string | null): string | null {
+  return sessionId ? `flocks:session:${sessionId}:dismissedGoal` : null;
+}
+
+function readDismissedGoalKey(sessionId?: string | null): string {
+  const storageKey = getDismissedGoalStorageKey(sessionId);
+  if (!storageKey || typeof window === 'undefined') return '';
+  try {
+    return window.localStorage.getItem(storageKey) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeDismissedGoalKey(sessionId: string | null | undefined, goalKey: string): void {
+  const storageKey = getDismissedGoalStorageKey(sessionId);
+  if (!storageKey || typeof window === 'undefined') return;
+  try {
+    if (goalKey) {
+      window.localStorage.setItem(storageKey, goalKey);
+    } else {
+      window.localStorage.removeItem(storageKey);
+    }
+  } catch {
+    // Ignore unavailable storage; dismissal still works for the current mount.
+  }
+}
+
+function toGoalBannerState(goal: SessionGoalState | null | undefined): GoalBannerState | null {
+  const objective = typeof goal?.objective === 'string' ? goal.objective.trim() : '';
+  const status = typeof goal?.status === 'string' ? goal.status : '';
+  if (!objective || !['active', 'completed', 'blocked', 'paused'].includes(status)) {
+    return null;
+  }
+  return {
+    objective,
+    status: status as GoalBannerStatus,
+    reason: typeof goal?.reason === 'string' ? goal.reason : undefined,
+  };
+}
+
+function getGoalStatusLabel(t: ReturnType<typeof useTranslation>['t'], status: GoalBannerStatus): string {
+  const fallback: Record<GoalBannerStatus, string> = {
+    active: 'Goal',
+    completed: 'Completed',
+    blocked: 'Blocked',
+    paused: 'Paused',
+  };
+  const key = `chat.goal.status.${status}`;
+  const label = t(key);
+  return label === key ? fallback[status] : label;
+}
+
+function getGoalBannerTone(status: GoalBannerStatus): {
+  root: string;
+  dot: string;
+  icon: React.ReactNode;
+} {
+  if (status === 'completed') {
+    return {
+      root: 'border-emerald-200 bg-emerald-50 text-emerald-900',
+      dot: 'bg-emerald-500',
+      icon: <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />,
+    };
+  }
+  if (status === 'blocked') {
+    return {
+      root: 'border-red-200 bg-red-50 text-red-900',
+      dot: 'bg-red-500',
+      icon: <AlertCircle className="h-3.5 w-3.5 text-red-600" />,
+    };
+  }
+  if (status === 'paused') {
+    return {
+      root: 'border-amber-200 bg-amber-50 text-amber-900',
+      dot: 'bg-amber-500',
+      icon: <Clock className="h-3.5 w-3.5 text-amber-600" />,
+    };
+  }
+  return {
+    root: 'border-sky-200 bg-sky-50 text-sky-950',
+    dot: 'bg-sky-500',
+    icon: <ListTree className="h-3.5 w-3.5 text-sky-600" />,
+  };
+}
+
+function GoalBanner({
+  goal,
+  t,
+  onDismiss,
+}: {
+  goal: GoalBannerState;
+  t: ReturnType<typeof useTranslation>['t'];
+  onDismiss: () => void;
+}) {
+  const tone = getGoalBannerTone(goal.status);
+  const statusLabel = getGoalStatusLabel(t, goal.status);
+  return (
+    <div className={`mb-2 flex min-w-0 items-center gap-2 rounded-lg border px-3 py-2 text-xs shadow-sm ${tone.root}`}>
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} />
+      <span className="shrink-0">{tone.icon}</span>
+      <span className="shrink-0 font-semibold">{statusLabel}</span>
+      <span className="min-w-0 flex-1 truncate font-medium">{goal.objective}</span>
+      {goal.reason && goal.status !== 'active' && (
+        <span className="hidden min-w-0 max-w-[35%] truncate text-[11px] opacity-70 sm:inline">
+          {goal.reason}
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="ml-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-current opacity-60 transition hover:bg-black/5 hover:opacity-100"
+        title={t('chat.goal.dismiss')}
+        aria-label={t('chat.goal.dismiss')}
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
 }
 
 interface QueuedPromptPanelProps {
@@ -697,34 +1256,41 @@ function QueuedPromptPanel({
   if (items.length === 0) return null;
 
   return (
-    <div className="mb-2 rounded-xl border border-zinc-200 bg-zinc-950/[0.02] overflow-hidden">
+    <div className="mb-2 overflow-hidden rounded-xl border border-zinc-200 bg-zinc-950/[0.02] dark:border-zinc-800 dark:bg-zinc-900/60">
       <button
         type="button"
         onClick={onToggle}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-zinc-600 hover:bg-zinc-100/70 transition-colors"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-zinc-600 transition-colors hover:bg-zinc-100/70 dark:text-zinc-300 dark:hover:bg-zinc-800"
       >
         <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? '' : '-rotate-90'}`} />
         <span>{t('chat.queue.count', { count: items.length })}</span>
       </button>
       {expanded && (
-        <div className="max-h-40 overflow-y-auto border-t border-zinc-200">
+        <div className="max-h-40 overflow-y-auto border-t border-zinc-200 dark:border-zinc-800">
           {items.map((item) => {
             const isEditing = editingId === item.id;
             const isBusy = actionId === item.id || item.status === 'executing';
             const text = getQueuedPromptText(item);
+            const instructionLabel = parseInstructionDisplayText(text);
             return (
-              <div key={item.id} className="flex items-start gap-2 px-3 py-2 border-b border-zinc-100 last:border-b-0">
-                <div className="mt-1 h-2 w-2 rounded-full border border-zinc-400 flex-shrink-0" />
+              <div key={item.id} className="flex items-start gap-2 border-b border-zinc-100 px-3 py-2 last:border-b-0 dark:border-zinc-800">
+                <div className="mt-1 h-2 w-2 flex-shrink-0 rounded-full border border-zinc-400 dark:border-zinc-500" />
                 <div className="min-w-0 flex-1">
                   {isEditing ? (
                     <textarea
                       value={editingText}
                       onChange={(event) => onEditChange(event.target.value)}
-                      className="w-full resize-none rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none focus:border-zinc-300 focus:ring-2 focus:ring-zinc-100"
+                      className="w-full resize-none rounded-lg border border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-800 outline-none focus:border-zinc-300 focus:ring-2 focus:ring-zinc-100 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-700 dark:focus:ring-zinc-800/70"
                       rows={2}
                     />
                   ) : (
-                    <div className="line-clamp-2 text-xs text-zinc-700">{text || t('chat.queue.attachmentOnly')}</div>
+                    instructionLabel ? (
+                      <span className="inline-flex max-w-full items-center truncate rounded-md border border-rose-100 bg-rose-50 px-2 py-1 text-xs font-semibold leading-none text-rose-700 dark:border-rose-500/30 dark:bg-rose-950/30 dark:text-rose-200">
+                        {instructionLabel}
+                      </span>
+                    ) : (
+                      <div className="line-clamp-2 text-xs text-zinc-700 dark:text-zinc-300">{text || t('chat.queue.attachmentOnly')}</div>
+                    )
                   )}
                 </div>
                 <div className="flex flex-shrink-0 items-center gap-1">
@@ -734,7 +1300,7 @@ function QueuedPromptPanel({
                         type="button"
                         onClick={() => onEditSave(item)}
                         disabled={isBusy || !editingText.trim()}
-                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40"
+                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title={t('chat.save')}
                       >
                         <Save className="h-3.5 w-3.5" />
@@ -743,7 +1309,7 @@ function QueuedPromptPanel({
                         type="button"
                         onClick={onEditCancel}
                         disabled={isBusy}
-                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40"
+                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title={t('chat.cancel')}
                       >
                         <X className="h-3.5 w-3.5" />
@@ -755,7 +1321,7 @@ function QueuedPromptPanel({
                         type="button"
                         onClick={() => onEditStart(item)}
                         disabled={isBusy}
-                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40"
+                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title={t('chat.queue.edit')}
                       >
                         <Pencil className="h-3.5 w-3.5" />
@@ -764,7 +1330,7 @@ function QueuedPromptPanel({
                         type="button"
                         onClick={() => onRunNow(item)}
                         disabled={isBusy}
-                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40"
+                        className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                         title={t('chat.queue.runNow')}
                       >
                         <ArrowUp className="h-3.5 w-3.5" />
@@ -773,7 +1339,7 @@ function QueuedPromptPanel({
                         type="button"
                         onClick={() => onRemove(item)}
                         disabled={isBusy}
-                        className="rounded p-1 text-zinc-500 hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
+                        className="rounded p-1 text-zinc-500 hover:bg-red-50 hover:text-red-600 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-red-950/40 dark:hover:text-red-300"
                         title={t('chat.queue.remove')}
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -856,6 +1422,8 @@ export default function SessionChat({
   const fullWidth = display?.fullWidth ?? false;
   const showActions = display?.showActions ?? false;
   const showTimestamp = display?.showTimestamp ?? false;
+  const collapseIntermediateSteps = display?.collapseIntermediateSteps ?? false;
+  const processGroupsDefaultOpen = display?.processGroupsDefaultOpen ?? false;
   const effectiveComposerTextareaMinHeight = composerTextareaMinHeight ?? 24;
   const effectiveComposerTextareaMaxHeight = composerTextareaMaxHeight ?? (compact ? 96 : 200);
   const effectivePlaceholder = placeholder ?? t('chat.placeholder');
@@ -866,6 +1434,7 @@ export default function SessionChat({
   const [input, setInput] = useState<string>(() => readChatDraft(sessionId));
   const [sending, setSending] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const activeToolPartIdsRef = useRef<Set<string>>(new Set());
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   // Lightbox preview for composer thumbnails. Shares the same overlay
@@ -874,6 +1443,8 @@ export default function SessionChat({
   const [composerPreview, setComposerPreview] = useState<{ url: string; alt?: string } | null>(null);
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactingMessage, setCompactingMessage] = useState('');
+  const [goalBanner, setGoalBanner] = useState<GoalBannerState | null>(null);
+  const [dismissedGoalKey, setDismissedGoalKey] = useState(() => readDismissedGoalKey(sessionId));
   const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
   const [queueExpanded, setQueueExpanded] = useState(true);
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
@@ -938,12 +1509,19 @@ export default function SessionChat({
   const [editingRole, setEditingRole] = useState<Message['role'] | null>(null);
   const [editingText, setEditingText] = useState('');
   const [actionMessageId, setActionMessageId] = useState<string | null>(null);
+  const [contextUsageSnapshot, setContextUsageSnapshot] = useState<ContextUsageSnapshot | null>(null);
+  const [contextUsageRefreshing, setContextUsageRefreshing] = useState(false);
+  const [contextUsageWindowTokens, setContextUsageWindowTokens] = useState(0);
+  const contextUsageRequestRef = useRef<{ sessionId: string; promise: Promise<void> } | null>(null);
+  const contextUsageRequestSeqRef = useRef(0);
+  const lastContextUsagePushAtRef = useRef(0);
   const isCompactingRef = useRef(false);
   const prevStreamingRef = useRef(false);
   // Tracks "sessionId::message" key to prevent double-send in React StrictMode
   const initialMessageSentRef = useRef('');
   const abortingRef = useRef(false);
   const sessionBusyRef = useRef(false);
+  const goalHydrationVersionRef = useRef(0);
   // ID of the assistant message that was aborted; used to ignore its finish event
   const abortedMessageIdRef = useRef<string | null>(null);
   const statusCheckedRef = useRef<string | null>(null);
@@ -957,6 +1535,7 @@ export default function SessionChat({
     clearAll: clearPendingQuestions,
   } = usePendingQuestions();
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContentRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1028,17 +1607,24 @@ export default function SessionChat({
     truncateAfterMessage,
   } =
     useSessionMessages(sessionId || undefined);
-  const estimatedContextTokens = useMemo(
-    () => estimateContextTokens(messages, input),
-    [messages, input],
+  const contextUsageMessages = contextUsageRefreshing && !contextUsageSnapshot ? [] : messages;
+  const contextUsageBreakdown = useMemo(
+    () => buildContextUsageBreakdown(contextUsageMessages, input, contextUsageSnapshot),
+    [contextUsageMessages, input, contextUsageSnapshot],
   );
-  const contextUsagePercent = contextWindowTokens && contextWindowTokens > 0
-    ? Math.min(100, Math.round((estimatedContextTokens / contextWindowTokens) * 100))
+  const estimatedContextTokens = contextUsageBreakdown.usedTokens;
+  const resolvedContextWindowTokens = contextUsageSnapshot?.contextWindow && contextUsageSnapshot.contextWindow > 0
+    ? contextUsageSnapshot.contextWindow
+    : contextUsageWindowTokens > 0
+      ? contextUsageWindowTokens
+    : (contextWindowTokens || 0);
+  const contextUsagePercent = resolvedContextWindowTokens > 0
+    ? Math.min(100, Math.round((estimatedContextTokens / resolvedContextWindowTokens) * 100))
     : 0;
-  const contextUsageTitle = contextWindowTokens && contextWindowTokens > 0
+  const contextUsageTitle = resolvedContextWindowTokens > 0
     ? t('chat.contextUsageTitle', {
         used: formatTokenCount(estimatedContextTokens),
-        total: formatTokenCount(contextWindowTokens),
+        total: formatTokenCount(resolvedContextWindowTokens),
         percent: contextUsagePercent,
       })
     : t('chat.contextUsageUnknown');
@@ -1064,6 +1650,85 @@ export default function SessionChat({
     }
   }, [sessionId]);
 
+  const refreshContextUsage = useCallback((options?: { clear?: boolean; skipIfFreshMs?: number }) => {
+    if (!sessionId) {
+      setContextUsageSnapshot(null);
+      setContextUsageRefreshing(false);
+      setContextUsageWindowTokens(0);
+      contextUsageRequestSeqRef.current += 1;
+      contextUsageRequestRef.current = null;
+      lastContextUsagePushAtRef.current = 0;
+      return;
+    }
+    if (options?.clear) {
+      setContextUsageSnapshot(null);
+      setContextUsageRefreshing(true);
+      contextUsageRequestSeqRef.current += 1;
+      contextUsageRequestRef.current = null;
+      lastContextUsagePushAtRef.current = 0;
+    } else if (
+      options?.skipIfFreshMs &&
+      Date.now() - lastContextUsagePushAtRef.current < options.skipIfFreshMs
+    ) {
+      return;
+    }
+
+    const existingRequest = contextUsageRequestRef.current;
+    if (existingRequest?.sessionId === sessionId) {
+      return existingRequest.promise;
+    }
+
+    const requestSessionId = sessionId;
+    const requestSeq = contextUsageRequestSeqRef.current;
+    const request = sessionApi.getContextUsage(requestSessionId).then((snapshot) => {
+      if (requestSeq === contextUsageRequestSeqRef.current && snapshot.sessionID === sessionId) {
+        setContextUsageSnapshot(snapshot);
+        if (snapshot.contextWindow && snapshot.contextWindow > 0) {
+          setContextUsageWindowTokens(snapshot.contextWindow);
+        }
+        setContextUsageRefreshing(false);
+      }
+    }).catch((err) => {
+      setContextUsageRefreshing(false);
+      console.warn('[SessionChat] Failed to fetch context usage:', err);
+    }).finally(() => {
+      if (contextUsageRequestRef.current?.promise === request) {
+        contextUsageRequestRef.current = null;
+      }
+    });
+    contextUsageRequestRef.current = { sessionId: requestSessionId, promise: request };
+    return request;
+  }, [sessionId]);
+
+  useEffect(() => {
+    void refreshContextUsage({ clear: true });
+  }, [refreshContextUsage]);
+
+  useEffect(() => {
+    goalHydrationVersionRef.current += 1;
+    const hydrationVersion = goalHydrationVersionRef.current;
+
+    if (!sessionId) {
+      setGoalBanner(null);
+      setDismissedGoalKey('');
+      return;
+    }
+
+    setGoalBanner(null);
+    setDismissedGoalKey(readDismissedGoalKey(sessionId));
+
+    sessionApi.get(sessionId).then((session) => {
+      if (goalHydrationVersionRef.current !== hydrationVersion) return;
+      setGoalBanner(toGoalBannerState(session.goal));
+      setDismissedGoalKey(readDismissedGoalKey(sessionId));
+    }).catch((err) => {
+      if (goalHydrationVersionRef.current !== hydrationVersion) return;
+      setGoalBanner(null);
+      setDismissedGoalKey(readDismissedGoalKey(sessionId));
+      console.warn('[SessionChat] Failed to fetch session goal:', err);
+    });
+  }, [sessionId]);
+
   const handleSSEEvent = useCallback(
     (event: SSEChatEvent) => {
       const { type, properties } = event;
@@ -1077,9 +1742,16 @@ export default function SessionChat({
       if (type === 'session.cleared' && properties.sessionID === sessionId) {
         abortingRef.current = false;
         sessionBusyRef.current = false;
+        activeToolPartIdsRef.current.clear();
         abortedMessageIdRef.current = null;
+        setContextUsageSnapshot(null);
+        setContextUsageRefreshing(true);
+        setContextUsageWindowTokens(0);
         setIsStreaming(false);
+        setGoalBanner(null);
+        setDismissedGoalKey('');
         refetch();
+        void refreshContextUsage({ clear: true });
       } else if (
         (type === 'session.status' && properties.sessionID === sessionId)
         || (type === 'session.updated' && properties.id === sessionId && properties.status === 'idle')
@@ -1101,12 +1773,14 @@ export default function SessionChat({
           setCompactionStages([]);
         } else if (statusType === 'idle') {
           sessionBusyRef.current = false;
+          activeToolPartIdsRef.current.clear();
           setIsStreaming(false);
           setIsCompacting(false);
           isCompactingRef.current = false;
           setCompactingMessage('');
           setCompactionStages([]);
           refetch();
+          void refreshContextUsage({ skipIfFreshMs: 500 });
         }
       } else if (type === 'message.updated' && properties.info?.sessionID === sessionId) {
         updateMessage(properties.info);
@@ -1120,10 +1794,11 @@ export default function SessionChat({
           // would replace the visible partial response with an empty message.
           if (shouldRefetch) {
             refetch();
-            if (!sessionBusyRef.current) {
+            if (!sessionBusyRef.current && activeToolPartIdsRef.current.size === 0) {
               setIsStreaming(false);
             }
           }
+          void refreshContextUsage();
           abortingRef.current = false;
           abortedMessageIdRef.current = null;
         } else if (
@@ -1134,6 +1809,15 @@ export default function SessionChat({
           setIsStreaming(true);
         }
       } else if (type === 'message.part.updated' && properties.part?.sessionID === sessionId) {
+        const part = properties.part as Pick<MessagePart, 'id' | 'type' | 'state'>;
+        if (part.id) {
+          if (isActiveToolPart(part)) {
+            activeToolPartIdsRef.current.add(part.id);
+            if (!abortingRef.current) setIsStreaming(true);
+          } else {
+            activeToolPartIdsRef.current.delete(part.id);
+          }
+        }
         updateMessagePart(properties.part, properties.delta);
         scrollToBottom();
       } else if (type === 'question.asked' && properties.sessionID === sessionId) {
@@ -1155,6 +1839,9 @@ export default function SessionChat({
         const stage = properties.stage as CompactionStage | undefined;
         const data = (properties.data ?? {}) as Record<string, unknown>;
         if (!stage) return;
+        if (stage === 'complete' && data.result === 'continue') {
+          void refreshContextUsage({ skipIfFreshMs: 500 });
+        }
         // Single source of truth: append into ``compactionStages`` and let
         // the progress bar derive ``done/total`` from it via useMemo.
         // ``chunk_done`` arrives in non-deterministic order under
@@ -1175,12 +1862,33 @@ export default function SessionChat({
         const items = Array.isArray(properties.items) ? properties.items : [];
         setQueuedPrompts(items as QueuedPrompt[]);
         if (items.length > 0) setQueueExpanded(true);
+      } else if (type === 'session.goal.updated' && properties.sessionID === sessionId) {
+        const nextGoal = toGoalBannerState(properties as SessionGoalState);
+        if (nextGoal) {
+          goalHydrationVersionRef.current += 1;
+          setGoalBanner(nextGoal);
+          setDismissedGoalKey(readDismissedGoalKey(sessionId));
+        }
+      } else if (type === 'context.compacted' && properties.sessionID === sessionId) {
+        void refreshContextUsage({ skipIfFreshMs: 500 });
+      } else if (type === 'context.usage.updated' && properties.sessionID === sessionId) {
+        setContextUsageSnapshot(properties as ContextUsageSnapshot);
+        if (typeof properties.contextWindow === 'number' && properties.contextWindow > 0) {
+          setContextUsageWindowTokens(properties.contextWindow);
+        }
+        contextUsageRequestSeqRef.current += 1;
+        contextUsageRequestRef.current = null;
+        lastContextUsagePushAtRef.current = Date.now();
+        setContextUsageRefreshing(false);
       } else if (type === 'session.error' && properties.sessionID === sessionId) {
         setIsStreaming(false);
         setIsCompacting(false);
         setCompactionStages([]);
+        setContextUsageRefreshing(false);
+        void refreshContextUsage({ skipIfFreshMs: 500 });
         abortingRef.current = false;
         sessionBusyRef.current = false;
+        activeToolPartIdsRef.current.clear();
         onError?.(properties.error?.message || t('chat.placeholder'));
       }
     },
@@ -1189,6 +1897,7 @@ export default function SessionChat({
       updateMessage,
       updateMessagePart,
       refetch,
+      refreshContextUsage,
       handleQuestionAsked,
       removeByRequestId,
       onSSEEvent,
@@ -1202,10 +1911,15 @@ export default function SessionChat({
       try {
         await submitAnswer(callID, requestId, answers);
       } catch (err: unknown) {
-        alert(`Submit failed: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        if (onError) {
+          onError(message);
+        } else {
+          toast.error(t('chat.questionSubmitFailed', 'Submit failed'), message);
+        }
       }
     },
-    [submitAnswer],
+    [onError, submitAnswer, t, toast],
   );
 
   const handleQuestionReject = useCallback(
@@ -1213,10 +1927,15 @@ export default function SessionChat({
       try {
         await submitReject(callID, requestId);
       } catch (err: unknown) {
-        alert(`Cancel failed: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        if (onError) {
+          onError(message);
+        } else {
+          toast.error(t('chat.questionCancelFailed', 'Cancel failed'), message);
+        }
       }
     },
-    [submitReject],
+    [onError, submitReject, t, toast],
   );
 
   const { status: sseStatus } = useSSE({
@@ -1225,6 +1944,7 @@ export default function SessionChat({
     onReconnect: () => {
       if (!sessionId) return;
       refetch();
+      refreshContextUsage();
       fetchPromptQueue();
       fetchPendingQuestions(sessionId).catch((err) => {
         console.warn('[SessionChat] Failed to recover pending questions after reconnect:', err);
@@ -1243,6 +1963,18 @@ export default function SessionChat({
   useEffect(() => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
+
+  useEffect(() => {
+    if (!isStreaming && !sending && !isCompacting) return;
+    const target = messagesContentRef.current;
+    if (!target || typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(() => {
+      scrollToBottom();
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [isStreaming, sending, isCompacting, scrollToBottom]);
 
   // Auto-resize textarea
   const autoResize = useCallback(() => {
@@ -1271,10 +2003,13 @@ export default function SessionChat({
     setIsCompacting(false);
     setCompactingMessage('');
     setCompactionStages([]);
+    setGoalBanner(null);
+    setDismissedGoalKey('');
     setQueuedPrompts([]);
     setEditingQueueId(null);
     setEditingQueueText('');
     setQueueActionId(null);
+    setContextUsageWindowTokens(0);
     setMentionRange(null);
     setMentionQuery('');
     setSelectedMentionIndex(0);
@@ -1654,6 +2389,12 @@ export default function SessionChat({
         arguments: args,
         agent: agentName,
       });
+      if (command === 'goal' && args.trim()) {
+        goalHydrationVersionRef.current += 1;
+        writeDismissedGoalKey(sessionId, '');
+        setGoalBanner({ objective: args.trim(), status: 'active' });
+        setDismissedGoalKey('');
+      }
     } catch (err: unknown) {
       setIsStreaming(false);
       const axiosErr = err as any;
@@ -1669,9 +2410,15 @@ export default function SessionChat({
   };
 
   /** Core send logic */
-  const sendText = async (text: string, imageParts: ImagePartData[] = [], agentOverride?: string) => {
+  const sendText = async (
+    text: string,
+    imageParts: ImagePartData[] = [],
+    agentOverride?: string,
+    options?: PromptDisplayOptions,
+  ) => {
     if (!sessionId) return;
     const effectiveAgent = agentOverride || agentName;
+    const visibleText = options?.displayText || text;
     // Clear abort state immediately so SSE events for the new stream are not suppressed
     abortingRef.current = false;
     // Force scroll to bottom when user sends a new message
@@ -1682,7 +2429,7 @@ export default function SessionChat({
 
     const tempId = `temp-${Date.now()}`;
     const tempParts: MessagePart[] = [];
-    if (text) tempParts.push({ id: `${tempId}-text`, type: 'text', text });
+    if (visibleText) tempParts.push({ id: `${tempId}-text`, type: 'text', text: visibleText });
     imageParts.forEach((img, i) => {
       tempParts.push({ id: `${tempId}-img-${i}`, type: 'file', url: img.url, mime: img.mime, filename: img.filename });
     });
@@ -1691,7 +2438,7 @@ export default function SessionChat({
       id: tempId,
       sessionID: sessionId,
       role: 'user',
-      parts: tempParts.length > 0 ? tempParts : [{ id: `${tempId}-part`, type: 'text', text }],
+      parts: tempParts.length > 0 ? tempParts : [{ id: `${tempId}-part`, type: 'text', text: visibleText }],
       timestamp: Date.now(),
       agent: effectiveAgent,
     } as Message);
@@ -1702,6 +2449,7 @@ export default function SessionChat({
       };
       if (effectiveAgent) payload.agent = effectiveAgent;
       if (model) payload.model = model;
+      if (options?.displayText) payload.displayText = options.displayText;
 
       await client.post(`/api/session/${sessionId}/prompt_async`, payload);
     } catch (err: unknown) {
@@ -1722,6 +2470,7 @@ export default function SessionChat({
     text: string,
     imageParts: ImagePartData[] = [],
     agentOverride?: string,
+    options?: PromptDisplayOptions,
   ) => {
     if (!sessionId) return;
     const effectiveAgent = agentOverride || agentName;
@@ -1730,6 +2479,7 @@ export default function SessionChat({
         parts: buildPromptParts(text, imageParts),
         ...(effectiveAgent ? { agent: effectiveAgent } : {}),
         ...(model ? { model } : {}),
+        ...(options?.displayText ? { displayText: options.displayText } : {}),
       });
       await fetchPromptQueue();
       setQueueExpanded(true);
@@ -1744,7 +2494,7 @@ export default function SessionChat({
     }
   };
 
-  const handleComposerPrompt = async (text: string) => {
+  const handleComposerPrompt = async (text: string, options?: PromptDisplayOptions) => {
     const trimmed = text.trim();
     if (!trimmed || sending) return;
 
@@ -1755,7 +2505,7 @@ export default function SessionChat({
 
     if (sessionId && isStreaming) {
       try {
-        await enqueueText(trimmed);
+        await enqueueText(trimmed, [], undefined, options);
       } catch {
         setInput(trimmed);
       }
@@ -1771,7 +2521,7 @@ export default function SessionChat({
       setSending(true);
       try {
         setPendingAgentName(agentName || 'rex');
-        await onCreateAndSend(trimmed, [], agentName);
+        await onCreateAndSend(trimmed, [], agentName, model, options);
       } catch {
         setInput(trimmed);
       } finally {
@@ -1781,7 +2531,7 @@ export default function SessionChat({
     }
 
     try {
-      await sendText(trimmed, [], agentName);
+      await sendText(trimmed, [], agentName, options);
     } catch {
       setInput(trimmed);
     }
@@ -1848,8 +2598,9 @@ export default function SessionChat({
       if (onCreateAndSend) {
         setSending(true);
         try {
-          setPendingAgentName(mentionedAgent || 'rex');
-          await onCreateAndSend(text, imageParts, mentionedAgent || undefined, model);
+          const effectiveAgent = mentionedAgent || agentName;
+          setPendingAgentName(effectiveAgent || 'rex');
+          await onCreateAndSend(text, imageParts, effectiveAgent || undefined, model);
           setAttachments([]);
         } catch {
           // Restore both the text and the attachment list so the user can
@@ -2074,6 +2825,16 @@ export default function SessionChat({
         const msgs: any[] = res.data || [];
         const lastMsg = msgs[msgs.length - 1];
         if (lastMsg?.info?.role === 'assistant' && (lastMsg.info.finish || lastMsg.info.time?.completed)) {
+          const hasFetchedActiveTool = msgs.some((msg) => hasActiveToolPart(msg.parts));
+          if (hasFetchedActiveTool) {
+            return;
+          }
+          activeToolPartIdsRef.current.clear();
+          const statusRes = await client.get('/api/session/status');
+          const status = statusRes.data?.[sessionId];
+          if (isActiveSessionStatus(status)) {
+            return;
+          }
           refetch();
           setIsStreaming(false);
         }
@@ -2212,18 +2973,12 @@ export default function SessionChat({
     }
   }, [editingMessageId, messages, resetEditingState]);
 
-  // ── Merged messages with compaction grouping ──
-  // The compaction divider is rendered at the position of the FIRST
-  // compacted message (not the summary), so it appears before the
-  // preserved messages rather than after them.
-  const { merged, compactedGroupMap, summaryRedirectMap, skipIndices } = useMemo(() => {
+  // ── Merged messages ──
+  // Archived-by-compaction messages stay visible in the UI timeline. The
+  // summary message itself renders as a divider, so multiple compactions
+  // naturally appear as multiple chronological separators.
+  const { merged, skipIndices } = useMemo(() => {
     const merged = mergeConsecutiveAssistantMessages(messages);
-    const compactedGroupMap = new Map<number, MergedMessage[]>();
-    // Maps: first-compacted-index → summary-message-index, so we can
-    // render the summary message at the earlier position.
-    const summaryRedirectMap = new Map<number, number>();
-    const compactedBuffer: MergedMessage[] = [];
-    let firstCompactedIdx = -1;
     const skipIndices = new Set<number>();
 
     for (let idx = 0; idx < merged.length; idx++) {
@@ -2236,44 +2991,27 @@ export default function SessionChat({
         skipIndices.add(idx);
         continue;
       }
-      if (msg.compacted) {
-        if (compactedBuffer.length === 0) firstCompactedIdx = idx;
-        compactedBuffer.push(msg);
-        skipIndices.add(idx);
-      } else if (msg.finish === 'summary' && compactedBuffer.length > 0) {
-        // Render the divider at the first compacted message's position
-        skipIndices.delete(firstCompactedIdx);
-        compactedGroupMap.set(firstCompactedIdx, [...compactedBuffer]);
-        summaryRedirectMap.set(firstCompactedIdx, idx);
-        // Skip the summary at its natural (later) position
-        skipIndices.add(idx);
-        compactedBuffer.length = 0;
-        firstCompactedIdx = -1;
-      }
     }
 
-    // Orphaned compacted messages (no summary found yet — e.g. compaction
-    // still in progress or summary missed during SSE race).  Un-skip them
-    // so they remain visible rather than silently disappearing.
-    if (compactedBuffer.length > 0) {
-      for (const orphan of compactedBuffer) {
-        const orphanIdx = merged.indexOf(orphan);
-        if (orphanIdx >= 0) skipIndices.delete(orphanIdx);
-      }
-      compactedBuffer.length = 0;
-    }
-
-    return { merged, compactedGroupMap, summaryRedirectMap, skipIndices };
+    return { merged, skipIndices };
   }, [messages]);
 
   // ── Styling based on compact mode ──
   const msgAreaClass = compact
-    ? 'relative flex flex-col flex-1 min-h-0 overflow-y-auto bg-gray-50 px-4 py-4'
-    : 'relative flex flex-col flex-1 min-h-0 overflow-y-auto bg-gray-50 py-6';
+    ? 'relative flex flex-col flex-1 min-h-0 overflow-y-auto bg-gray-50 px-4 py-4 dark:bg-zinc-950'
+    : 'relative flex flex-col flex-1 min-h-0 overflow-y-auto bg-gray-50 py-6 dark:bg-zinc-950';
 
   const msgListClass = compact
     ? fullWidth ? 'space-y-3 w-full px-4' : 'space-y-3'
-    : fullWidth ? 'space-y-5 w-full px-5' : 'space-y-5 w-[min(76%,64rem)] mx-auto pl-4 pr-8';
+    : fullWidth ? 'space-y-5 w-full px-5' : 'space-y-5 w-[min(76%,64rem)] mx-auto px-6';
+  const visibleGoalBanner = goalBanner && getGoalBannerKey(goalBanner) !== dismissedGoalKey
+    ? goalBanner
+    : null;
+  const handleDismissGoalBanner = useCallback(() => {
+    const goalKey = getGoalBannerKey(visibleGoalBanner);
+    writeDismissedGoalKey(sessionId, goalKey);
+    setDismissedGoalKey(goalKey);
+  }, [sessionId, visibleGoalBanner]);
 
   return (
     <div className={`flex flex-col min-h-0 ${className}`}>
@@ -2303,27 +3041,26 @@ export default function SessionChat({
             <div className="text-center py-8 text-gray-400 text-sm">{effectiveEmptyText}</div>
           )
         ) : (
-          <div className={msgListClass}>
+          <div ref={messagesContentRef} className={msgListClass}>
             {merged.map((msg, i) => {
               if (skipIndices.has(i)) return null;
-              // If this position is a redirect, render the summary message here
-              const redirectIdx = summaryRedirectMap.get(i);
-              const messageToRender = redirectIdx !== undefined ? merged[redirectIdx] : msg;
               return (
                 <ChatMessageBubble
-                  key={messageToRender.id}
-                  message={messageToRender}
+                  key={msg.id}
+                  message={msg}
                   isActive={
                     isStreaming &&
                     i === merged.length - 1 &&
-                    messageToRender.role === 'assistant' &&
-                    !messageToRender.finish
+                    msg.role === 'assistant' &&
+                    !msg.finish
                   }
                   pendingQuestions={pendingQuestions}
                   onQuestionAnswer={handleQuestionAnswer}
                   onQuestionReject={handleQuestionReject}
                   showActions={showActions}
                   showTimestamp={showTimestamp}
+                  collapseIntermediateSteps={collapseIntermediateSteps}
+                  processGroupsDefaultOpen={processGroupsDefaultOpen}
                   compact={compact}
                   onCopy={handleCopy}
                   editingMessageId={editingMessageId}
@@ -2336,7 +3073,6 @@ export default function SessionChat({
                   onEditSave={handleSaveEditedMessage}
                   onEditSend={handleSendEditedUserMessage}
                   onRegenerate={handleRegenerateMessage}
-                  compactedMessages={compactedGroupMap.get(i)}
                 />
               );
             })}
@@ -2344,20 +3080,20 @@ export default function SessionChat({
             {/* Compacting indicator with live progress stages */}
             {isCompacting && (
               <div className={`group relative ${!compact ? 'w-full' : ''} flex`}>
-                <div className={`flex gap-2.5 ${getMessageGroupClassName({ compact, isUser: false, isEditing: false })}`}>
+                <div className={compact ? `flex gap-2.5 ${getMessageGroupClassName({ compact, isUser: false, isEditing: false })}` : 'flex w-full min-w-0'}>
                   <span
-                    className={`inline-flex items-center justify-center rounded-full bg-red-500 text-white font-bold shadow-sm ring-2 ring-white flex-shrink-0 ${
+                    className={`inline-flex items-center justify-center rounded-full bg-red-500 text-white font-bold shadow-sm ring-2 ring-white flex-shrink-0 dark:ring-zinc-950 ${
                       compact ? 'w-7 h-7 text-xs' : 'w-8 h-8 text-sm'
-                    }`}
+                    } ${compact ? '' : 'absolute -left-10 top-1'}`}
                   >
                     {formatAgentName(pendingAgentName).charAt(0).toUpperCase()}
                   </span>
                   <div className="flex flex-col items-start flex-1 min-w-0">
                     <div className={`flex items-center gap-2 ${compact ? 'h-7' : 'h-8'}`}>
-                      <span className="text-xs font-semibold text-zinc-700">{formatAgentName(pendingAgentName)}</span>
+                      <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">{formatAgentName(pendingAgentName)}</span>
                     </div>
                     <div className="flex flex-col min-w-0 w-full">
-                      <div className={`${compact ? 'max-w-[90%] px-4 py-3 rounded-[20px]' : 'w-full px-5 py-4 rounded-[24px]'} text-sm break-words shadow-sm bg-amber-50 border border-amber-200`}>
+                      <div className={`${compact ? 'w-full max-w-full px-4 py-3 rounded-[20px]' : 'w-full px-5 py-4 rounded-[24px]'} text-sm break-words shadow-sm bg-amber-50 border border-amber-200 dark:border-amber-500/35 dark:bg-amber-950/30 dark:shadow-none`}>
                         <div className="flex items-center gap-2 text-sm text-amber-700">
                           <Loader2 className="w-4 h-4 animate-spin text-amber-500" />
                           <span>{compactingMessage || t('chat.compacting')}</span>
@@ -2402,17 +3138,17 @@ export default function SessionChat({
             {/* Standalone thinking indicator when no incomplete message exists */}
             {(isStreaming || sending) && !isCompacting && !(messages.length > 0 && messages[messages.length - 1].role === 'assistant' && !messages[messages.length - 1].finish) && (
               <div className={`group relative ${!compact ? 'w-full' : ''} flex`}>
-                <div className={`flex gap-2.5 ${getMessageGroupClassName({ compact, isUser: false, isEditing: false })}`}>
+                <div className={compact ? `flex gap-2.5 ${getMessageGroupClassName({ compact, isUser: false, isEditing: false })}` : 'flex w-full min-w-0'}>
                   <span
-                    className={`inline-flex items-center justify-center rounded-full bg-red-500 text-white font-bold shadow-sm ring-2 ring-white flex-shrink-0 ${
+                    className={`inline-flex items-center justify-center rounded-full bg-red-500 text-white font-bold shadow-sm ring-2 ring-white flex-shrink-0 dark:ring-zinc-950 ${
                       compact ? 'w-7 h-7 text-xs' : 'w-8 h-8 text-sm'
-                    }`}
+                    } ${compact ? '' : 'absolute -left-10 top-1'}`}
                   >
                     {formatAgentName(pendingAgentName).charAt(0).toUpperCase()}
                   </span>
                   <div className="flex flex-col items-start flex-1 min-w-0">
                     <div className={`flex items-center gap-2 ${compact ? 'h-7' : 'h-8'}`}>
-                      <span className="text-xs font-semibold text-zinc-700">{formatAgentName(pendingAgentName)}</span>
+                      <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">{formatAgentName(pendingAgentName)}</span>
                     </div>
                     <div className="flex flex-col min-w-0 w-full">
                       <div className={getStandaloneThinkingBubbleClassName(compact)}>
@@ -2432,32 +3168,11 @@ export default function SessionChat({
           </div>
         )}
         <div ref={messagesEndRef} className="h-0 flex-shrink-0" />
-
-        {/* Conversation bottom slot: lives inside the scrollable conversation area. */}
-        {conversationBottomSlot && !hideInput && (
-          <div className="sticky bottom-0 z-10 -mx-1 mt-auto translate-y-4 pt-1 bg-gradient-to-t from-gray-50 via-gray-50/95 to-transparent">
-            <div className={`relative min-w-0 ${!compact ? 'w-[min(76%,64rem)] mx-auto pl-4 pr-8' : ''}`}>
-              {typeof conversationBottomSlot === 'function'
-                ? conversationBottomSlot({
-                  sendPrompt: (text) => { void handleComposerPrompt(text); },
-                  setInput: (text) => {
-                    setInput(text);
-                    requestAnimationFrame(() => textareaRef.current?.focus());
-                  },
-                  focusInput: () => textareaRef.current?.focus(),
-                  sending,
-                  streaming: isStreaming,
-                  sessionId,
-                })
-                : conversationBottomSlot}
-            </div>
-          </div>
-        )}
       </div>
 
       {/* Suggestions — shown before user sends any message */}
       {suggestions && suggestions.length > 0 && !hasUserMessage && !hideInput && (
-        <div className="flex-shrink-0 px-3 pt-2.5 pb-2 border-t border-gray-100 bg-white">
+        <div className="flex-shrink-0 px-3 pt-2.5 pb-2 border-t border-gray-100 bg-white dark:border-zinc-800 dark:bg-zinc-950">
           <div className="flex items-center gap-1.5 mb-2">
             <span className="text-xs font-medium text-gray-400">{t('chat.suggestions')}</span>
           </div>
@@ -2478,8 +3193,33 @@ export default function SessionChat({
 
       {/* Follow-up input */}
       {!hideInput && (
-        <div className={`flex-shrink-0 bg-white ${compact ? 'px-4 py-3' : 'py-4'}`}>
-          <div className={`relative min-w-0 ${!compact ? (fullWidth ? 'w-full px-5' : 'w-[min(76%,64rem)] mx-auto pr-8 pl-[58px]') : ''}`}>
+        <div className={`flex-shrink-0 bg-white ${compact ? 'px-4 py-3' : 'py-4'} dark:bg-zinc-950`}>
+          <div className={`relative min-w-0 ${!compact ? (fullWidth ? 'w-full px-5' : 'w-[min(76%,64rem)] mx-auto px-6') : ''}`}>
+            {conversationBottomSlot && (
+              <div className="mb-2 min-w-0">
+                {typeof conversationBottomSlot === 'function'
+                  ? conversationBottomSlot({
+                    sendPrompt: (text, options) => { void handleComposerPrompt(text, options); },
+                    setInput: (text) => {
+                      setInput(text);
+                      requestAnimationFrame(() => textareaRef.current?.focus());
+                    },
+                    focusInput: () => textareaRef.current?.focus(),
+                    sending,
+                    streaming: isStreaming,
+                    sessionId,
+                    hasMessages: messages.length > 0,
+                  })
+                  : conversationBottomSlot}
+              </div>
+            )}
+            {visibleGoalBanner && (
+              <GoalBanner
+                goal={visibleGoalBanner}
+                t={t}
+                onDismiss={handleDismissGoalBanner}
+              />
+            )}
             <QueuedPromptPanel
               items={queuedPrompts}
               expanded={queueExpanded}
@@ -2530,20 +3270,20 @@ export default function SessionChat({
               onDrop={handleComposerDrop}
               className={`rounded-2xl border transition-all ${
                 isCompacting
-                  ? 'border-amber-200 bg-amber-50/30'
+                  ? 'border-amber-200 bg-amber-50/30 dark:border-amber-500/35 dark:bg-amber-950/25'
                   : isDragOver
-                    ? 'border-sky-300 bg-sky-50/60 ring-4 ring-sky-100'
+                    ? 'border-sky-300 bg-sky-50/60 ring-4 ring-sky-100 dark:border-sky-500/50 dark:bg-sky-950/35 dark:ring-sky-500/10'
                     : isStreaming
-                      ? 'border-zinc-200 bg-zinc-50'
-                      : 'border-zinc-200 bg-zinc-50 hover:border-zinc-300 focus-within:border-zinc-300 focus-within:bg-white focus-within:ring-4 focus-within:ring-zinc-100'
+                      ? 'border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/70'
+                      : 'border-zinc-200 bg-zinc-50 hover:border-zinc-300 focus-within:border-zinc-300 focus-within:bg-white focus-within:ring-4 focus-within:ring-zinc-100 dark:border-zinc-800 dark:bg-zinc-900/70 dark:hover:border-zinc-700 dark:focus-within:border-zinc-700 dark:focus-within:bg-zinc-900 dark:focus-within:ring-zinc-800/60'
               }`}
             >
                 {/* Node reference chip */}
                 {nodeRef && (
                   <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-slate-400 flex-shrink-0" />
-                    <code className="text-[11px] font-mono font-semibold text-slate-700 truncate flex-1">{nodeRef.id}</code>
-                    <span className="text-[10px] text-slate-400 flex-shrink-0">{nodeRef.type}</span>
+                    <code className="text-[11px] font-mono font-semibold text-slate-700 truncate flex-1 dark:text-slate-200">{nodeRef.id}</code>
+                    <span className="text-[10px] text-slate-400 flex-shrink-0 dark:text-slate-500">{nodeRef.type}</span>
                     {onNodeRefDismiss && (
                       <button
                         onClick={onNodeRefDismiss}
@@ -2570,7 +3310,7 @@ export default function SessionChat({
                           <div
                             key={attachment.id}
                             className={`relative flex-shrink-0 rounded-lg border overflow-hidden ${
-                              isUploading ? 'border-sky-200 bg-sky-50' : 'border-gray-200 bg-gray-50'
+                              isUploading ? 'border-sky-200 bg-sky-50 dark:border-sky-500/35 dark:bg-sky-950/30' : 'border-gray-200 bg-gray-50 dark:border-zinc-800 dark:bg-zinc-900'
                             }`}
                           >
                             {isUploading ? (
@@ -2608,7 +3348,7 @@ export default function SessionChat({
                               ? 'border-red-200 bg-red-50 text-red-700'
                               : isUploading
                                 ? 'border-sky-200 bg-sky-50 text-sky-700'
-                                : 'border-gray-200 bg-gray-50 text-gray-700'
+                                : 'border-gray-200 bg-gray-50 text-gray-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200'
                           }`}
                         >
                           {isUploading ? (
@@ -2698,8 +3438,8 @@ export default function SessionChat({
                             ? t('chat.placeholderNodeRef', { nodeId: nodeRef.id })
                             : effectivePlaceholder
                     }
-                    className={`w-full resize-none outline-none bg-transparent text-sm placeholder-zinc-400 ${
-                      sending ? 'text-zinc-400 cursor-not-allowed' : 'text-zinc-900'
+                    className={`w-full resize-none outline-none bg-transparent text-sm placeholder-zinc-400 dark:placeholder-zinc-600 ${
+                      sending ? 'text-zinc-400 cursor-not-allowed dark:text-zinc-500' : 'text-zinc-900 dark:text-zinc-100'
                     }`}
                     style={{
                       minHeight: `${effectiveComposerTextareaMinHeight}px`,
@@ -2722,7 +3462,7 @@ export default function SessionChat({
                     <Paperclip className="h-4 w-4" />
                   </button>
 
-                  <div className="mx-1 h-4 w-px shrink-0 bg-zinc-200" />
+                  <div className="mx-1 h-4 w-px shrink-0 bg-zinc-200 dark:bg-zinc-800" />
 
                   {toolbarSlot}
 
@@ -2734,10 +3474,13 @@ export default function SessionChat({
 
                   <div className="flex-1" />
 
-                  {contextWindowTokens && contextWindowTokens > 0 && (
+                  {resolvedContextWindowTokens > 0 && (
                     <ContextUsageRing
                       percent={contextUsagePercent}
                       title={contextUsageTitle}
+                      usedTokens={estimatedContextTokens}
+                      totalTokens={resolvedContextWindowTokens}
+                      breakdown={contextUsageBreakdown}
                     />
                   )}
 
@@ -2768,7 +3511,7 @@ export default function SessionChat({
                       className={`inline-flex h-8 w-8 items-center justify-center rounded-full transition-all ${
                         canSend
                           ? 'bg-sky-500 text-white hover:bg-sky-600 shadow-sm hover:shadow'
-                          : 'bg-zinc-200 text-zinc-400 cursor-not-allowed'
+                          : 'cursor-not-allowed border border-zinc-300 bg-zinc-200 text-zinc-400 dark:border-[#5a6573] dark:bg-[#46515e] dark:text-[#b8c2cc]'
                       }`}
                     >
                       {sending || hasUploadingFiles ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowUp className="w-4 h-4" strokeWidth={2.5} />}
@@ -2815,10 +3558,10 @@ function AgentMentionDropdown({
 
   return (
     <div
-      className="absolute bottom-full left-0 right-0 mb-1 z-50 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg"
+      className="absolute bottom-full left-0 right-0 z-50 mb-1 overflow-hidden rounded-lg border border-gray-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-xl dark:shadow-black/30"
       onMouseDown={(e) => e.preventDefault()}
     >
-      <div className="border-b border-gray-100 bg-gray-50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400">
+      <div className="border-b border-gray-100 bg-gray-50 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-500">
         {t('chat.mention.title')}
       </div>
       <div ref={listRef} className="max-h-64 overflow-y-auto p-1">
@@ -2831,17 +3574,17 @@ function AgentMentionDropdown({
               onClick={() => onSelect(agent)}
               onMouseDown={(e) => e.preventDefault()}
               className={`flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors ${
-                idx === selectedIndex ? 'bg-sky-50 text-sky-800' : 'text-gray-800 hover:bg-gray-50'
+                idx === selectedIndex ? 'bg-sky-50 text-sky-800 dark:bg-sky-950/45 dark:text-sky-100' : 'text-gray-800 hover:bg-gray-50 dark:text-zinc-200 dark:hover:bg-zinc-800'
               }`}
             >
-              <Bot className="h-3.5 w-3.5 shrink-0 text-gray-400" />
+              <Bot className="h-3.5 w-3.5 shrink-0 text-gray-400 dark:text-zinc-500" />
               <span className="shrink-0 font-mono text-sm font-semibold">@{agent.name}</span>
-              <span className="min-w-0 truncate text-xs text-gray-500">{desc}</span>
+              <span className="min-w-0 truncate text-xs text-gray-500 dark:text-zinc-400">{desc}</span>
             </button>
           );
         })}
       </div>
-      <div className="flex gap-3 border-t border-gray-100 bg-gray-50 px-3 py-1 text-[10px] text-gray-400">
+      <div className="flex gap-3 border-t border-gray-100 bg-gray-50 px-3 py-1 text-[10px] text-gray-400 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-500">
         <span><kbd className="font-mono">↑↓</kbd> {t('chat.mention.navigate')}</span>
         <span><kbd className="font-mono">Enter</kbd>/<kbd className="font-mono">Tab</kbd> {t('chat.mention.select')}</span>
       </div>
@@ -2861,6 +3604,8 @@ export interface ChatMessageBubbleProps {
   onQuestionReject?: (callID: string, requestId: string) => Promise<void>;
   showActions?: boolean;
   showTimestamp?: boolean;
+  collapseIntermediateSteps?: boolean;
+  processGroupsDefaultOpen?: boolean;
   compact?: boolean;
   onCopy?: (text: string) => void;
   editingMessageId?: string | null;
@@ -2873,8 +3618,32 @@ export interface ChatMessageBubbleProps {
   onEditSave?: () => Promise<void>;
   onEditSend?: () => Promise<void>;
   onRegenerate?: (messageId: string) => Promise<void>;
-  /** Compacted messages that precede this summary message */
-  compactedMessages?: MergedMessage[];
+}
+
+function ProcessGroupDetails({
+  defaultOpen,
+  children,
+}: {
+  defaultOpen: boolean;
+  children: React.ReactNode;
+}) {
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+
+  useLayoutEffect(() => {
+    if (detailsRef.current) {
+      detailsRef.current.open = defaultOpen;
+    }
+  }, [defaultOpen]);
+
+  return (
+    <details
+      ref={detailsRef}
+      data-testid="chat-process-group"
+      className="group/process mt-2 first:mt-0 overflow-hidden rounded-lg border border-zinc-200/90 bg-white/80 shadow-none"
+    >
+      {children}
+    </details>
+  );
 }
 
 function ChatMessageBubbleInner({
@@ -2885,6 +3654,8 @@ function ChatMessageBubbleInner({
   onQuestionReject,
   showActions = false,
   showTimestamp = false,
+  collapseIntermediateSteps = false,
+  processGroupsDefaultOpen = false,
   compact = true,
   onCopy,
   editingMessageId,
@@ -2897,7 +3668,6 @@ function ChatMessageBubbleInner({
   onEditSave,
   onEditSend,
   onRegenerate,
-  compactedMessages,
 }: ChatMessageBubbleProps) {
   const { t } = useTranslation('session');
   const isUser = message.role === 'user';
@@ -2909,33 +3679,13 @@ function ChatMessageBubbleInner({
   // instead — same UX, no popup blocker / data-URL restriction headaches.
   const [previewImage, setPreviewImage] = useState<{ url: string; alt?: string } | null>(null);
   if (message.finish === 'summary') {
-    const hasArchived = compactedMessages && compactedMessages.length > 0;
     return (
-      <div className="my-3 px-1">
-        {/* Archived messages shown inline without collapse */}
-        {hasArchived && (
-          <div className="mb-3 space-y-3">
-            {compactedMessages!.map((cMsg) => (
-              <ChatMessageBubble
-                key={cMsg.id}
-                message={cMsg}
-                showTimestamp={showTimestamp}
-                compact={compact}
-                onCopy={onCopy}
-                editingMessageId={editingMessageId}
-                editingText={editingText}
-                actionsDisabled={actionsDisabled}
-                actionMessageId={actionMessageId}
-                onEditStart={onEditStart}
-                onEditChange={onEditChange}
-                onEditCancel={onEditCancel}
-                onEditSave={onEditSave}
-                onEditSend={onEditSend}
-                onRegenerate={onRegenerate}
-              />
-            ))}
-          </div>
-        )}
+      <div className={getCompactionDividerClassName(compact)}>
+        <span className="h-px flex-1 bg-zinc-200" />
+        <span className="shrink-0 px-1.5 font-medium text-zinc-500">
+          {t('chat.contextCompressed')}
+        </span>
+        <span className="h-px flex-1 bg-zinc-200" />
       </div>
     );
   }
@@ -2957,22 +3707,28 @@ function ChatMessageBubbleInner({
   const editableRawText = latestEditablePart?.text || '';
   const isEditing = !!targetPartId && editingMessageId === targetMessageId;
   const isActionPending = actionMessageId === targetMessageId;
+  const instructionDisplayLabel = isUser && !isEditing && editableTextParts.length === 1
+    ? parseInstructionDisplayText(getMessagePartDisplayText(editableTextParts[0]))
+    : null;
 
-  const bubbleClass = getMessageBubbleClassName({ compact, isUser, isEditing });
+  const bubbleClass = instructionDisplayLabel
+    ? getInstructionDisplayBubbleClassName(compact)
+    : getMessageBubbleClassName({ compact, isUser, isEditing });
   const messageGroupClass = getMessageGroupClassName({ compact, isUser, isEditing });
   const actionBarClass = `flex items-center gap-1.5`;
   const editingActionBarClass = getEditingActionBarClassName();
-  const iconButtonClass = 'group/action relative inline-flex h-6 w-6 items-center justify-center rounded-full border border-gray-200/80 bg-white/80 text-gray-400 transition-colors duration-150 hover:border-gray-300 hover:text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed';
+  const iconButtonClass = 'group/action relative inline-flex h-6 w-6 items-center justify-center rounded-full border border-gray-200/80 bg-white/80 text-gray-400 transition-colors duration-150 hover:border-gray-300 hover:text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed dark:border-zinc-800 dark:bg-zinc-900/80 dark:text-zinc-500 dark:hover:border-zinc-700 dark:hover:text-zinc-200';
   const tooltipClass = 'pointer-events-none absolute bottom-full left-1/2 z-10 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-md bg-gray-900 px-2 py-1 text-[11px] font-medium text-white opacity-0 shadow-sm transition-opacity duration-150 group-hover/action:opacity-100';
+  const messageErrorText = isUser ? '' : getMessageErrorText(message);
 
   const avatarSize = compact ? 'w-7 h-7 text-xs' : 'w-8 h-8 text-sm';
 
   const avatar = isUser ? (
-    <span className={`inline-flex items-center justify-center rounded-full bg-gradient-to-b from-sky-400 to-blue-500 text-white shadow-sm ring-2 ring-white flex-shrink-0 ${avatarSize}`}>
+    <span className={`inline-flex items-center justify-center rounded-full bg-gradient-to-b from-sky-400 to-blue-500 text-white shadow-sm ring-2 ring-white flex-shrink-0 dark:ring-zinc-950 ${avatarSize}`}>
       <User className={compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} />
     </span>
   ) : (
-    <span className={`inline-flex items-center justify-center rounded-full bg-red-500 text-white font-bold shadow-sm ring-2 ring-white flex-shrink-0 ${avatarSize}`}>
+    <span className={`inline-flex items-center justify-center rounded-full bg-red-500 text-white font-bold shadow-sm ring-2 ring-white flex-shrink-0 dark:ring-zinc-950 ${avatarSize}`}>
       {agentName.charAt(0).toUpperCase()}
     </span>
   );
@@ -2989,11 +3745,18 @@ function ChatMessageBubbleInner({
             {t('chat.sending')}
           </div>
         ) : (
-          <div className="flex items-center gap-1 py-1" aria-label={t('chat.thinking')}>
-            <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:-0.3s]" />
-            <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:-0.15s]" />
-            <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce" />
-          </div>
+          messageErrorText ? (
+            <div className="flex items-start gap-2 py-1 text-sm text-red-700" role="alert">
+              <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-red-500" />
+              <span className="whitespace-pre-wrap break-words">{messageErrorText}</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1 py-1" aria-label={t('chat.thinking')}>
+              <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:-0.3s]" />
+              <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce [animation-delay:-0.15s]" />
+              <span className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-bounce" />
+            </div>
+          )
         )
       )}
 
@@ -3014,6 +3777,186 @@ function ChatMessageBubbleInner({
           // UX for "look at this image and …" style messages.
           const fileParts = parts.filter((p) => p.type === 'file' && p.url);
           const displayParts = parts.filter((p) => !(p.type === 'file' && p.url));
+          const isBlockingQuestionToolPart = (part: MessagePart): boolean => {
+            if (part.type !== 'tool') return false;
+            if (part.callID && pendingQuestions?.[part.callID]) return true;
+            const toolName = (part.tool || '').toLowerCase();
+            return toolName === 'question' || toolName === 'request_user_input' || toolName.includes('question');
+          };
+          const isIntermediateProcessPart = (part: MessagePart): boolean => {
+            if (part.type === 'reasoning' || part.type === 'thinking') {
+              return !!getRenderableThinkingText(part);
+            }
+            return part.type === 'tool' && !isBlockingQuestionToolPart(part);
+          };
+          const isRenderableDisplayPart = (part: MessagePart): boolean => {
+            if (isIntermediateProcessPart(part)) return true;
+            if (part.type === 'text') return !!getMessagePartDisplayText(part).trim();
+            if (part.type === 'tool') return true;
+            if (part.type === 'file') return !!part.url;
+            return false;
+          };
+          const renderPart = (part: MessagePart, i: number) => (
+            // Spacing between consecutive parts is owned by this wrapper,
+            // not by individual part components. Each part used to set its
+            // own `mt-2 first:mt-0`, but since every part lives in its own
+            // wrapper div, `first:` always matched and the gap collapsed
+            // to zero between, e.g., a tool card and the next thinking
+            // block, making them look glued together.
+            <div key={part.id || i} className="mt-2 first:mt-0">
+              {/* Text */}
+              {part.type === 'text' && (() => {
+                const rawText = part.text || '';
+                const nodeRefMatch = isUser
+                  ? rawText.match(/^@@node:([^|\n]+)\|([^\n]+)\n([\s\S]*)$/)
+                  : null;
+                const partDisplayText = getMessagePartDisplayText(part);
+                if (!partDisplayText.trim()) return null;
+                const displayText = nodeRefMatch && partDisplayText === rawText ? nodeRefMatch[3] : partDisplayText;
+                const instructionLabel = isUser ? parseInstructionDisplayText(displayText) : null;
+                if (instructionLabel) {
+                  return (
+                    <span className="inline-flex max-w-full items-center truncate text-sm font-semibold leading-none text-rose-700">
+                      {instructionLabel}
+                    </span>
+                  );
+                }
+                return (
+                  <>
+                    {nodeRefMatch && (
+                      <div className="flex items-center gap-1.5 mb-2 bg-gray-100 border border-gray-200 rounded-md px-2 py-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-gray-400 flex-shrink-0" />
+                        <code className="text-[10px] font-mono font-semibold text-gray-700 truncate">{nodeRefMatch[1]}</code>
+                        <span className="text-[9px] text-gray-500 flex-shrink-0">{nodeRefMatch[2]}</span>
+                      </div>
+                    )}
+                    <StreamingMarkdown
+                      content={displayText}
+                      isStreaming={isActive && !isUser}
+                    />
+                  </>
+                );
+              })()}
+
+              {/* Tool call */}
+              {part.type === 'tool' && (
+                <ChatToolPart
+                  part={part}
+                  pendingQuestion={part.callID ? pendingQuestions?.[part.callID] : undefined}
+                  onAnswer={onQuestionAnswer && part.callID
+                    ? (answers) => onQuestionAnswer(part.callID!, pendingQuestions![part.callID!].requestId, answers)
+                    : undefined}
+                  onReject={onQuestionReject && part.callID
+                    ? () => onQuestionReject(part.callID!, pendingQuestions![part.callID!].requestId)
+                    : undefined}
+                />
+              )}
+
+              {/* Reasoning / thinking */}
+              {(part.type === 'reasoning' || part.type === 'thinking') && (() => {
+                const thinkingText = getRenderableThinkingText(part);
+                if (!thinkingText) return null;
+                const partKey = part.id || `reasoning-${i}`;
+                const isExpanded = getPartExpanded(partKey);
+                const isThinking = !isReasoningDone;
+                return (
+                  // Vertical spacing is provided by the parent part wrapper
+                  // (see `otherParts.map` above); keep this container neutral
+                  // so wrapper-level `mt-2 first:mt-0` is the single source of
+                  // truth for inter-part gaps.
+                  <div>
+                    <button
+                      onClick={() => togglePart(partKey)}
+                      disabled={isThinking}
+                      className="group/think w-full text-left"
+                    >
+                      <div className={`flex items-center gap-2 px-2.5 py-1.5 rounded-md border text-xs transition-colors ${
+                        isThinking
+                          ? 'bg-sky-50 border-sky-100'
+                          : 'bg-zinc-50 border-zinc-200 hover:bg-zinc-100'
+                      }`}>
+                        {isThinking ? (
+                          <>
+                            <Brain className="w-3.5 h-3.5 flex-shrink-0 text-violet-500" />
+                            <span className="text-violet-600">{t('chat.thinking')}</span>
+                          </>
+                        ) : (
+                          <>
+                            <Brain className="w-3.5 h-3.5 flex-shrink-0 text-violet-500" />
+                            <span className="text-zinc-500 truncate min-w-0">
+                              {thinkingText.slice(0, 80)}{thinkingText.length > 80 ? '…' : ''}
+                            </span>
+                            <ChevronDown className={`w-3 h-3 ml-auto text-zinc-400 flex-shrink-0 transition-transform ${isExpanded ? '' : '-rotate-90'}`} />
+                          </>
+                        )}
+                      </div>
+                    </button>
+                    {isExpanded && (
+                      <div className="mt-1 px-2.5 py-2 bg-zinc-50 rounded-md border border-zinc-200 text-[11px] text-zinc-500 whitespace-pre-wrap font-mono leading-relaxed max-h-52 overflow-y-auto">
+                        {thinkingText}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+          );
+          const renderProcessGroup = (group: Array<{ part: MessagePart; index: number }>, groupIndex: number) => {
+            const reasoningCount = group.filter(({ part }) => part.type === 'reasoning' || part.type === 'thinking').length;
+            const toolCount = group.filter(({ part }) => part.type === 'tool').length;
+            const summary = [
+              reasoningCount > 0 ? t('chat.process.reasoningCount', { count: reasoningCount }) : '',
+              toolCount > 0 ? t('chat.process.toolCount', { count: toolCount }) : '',
+            ].filter(Boolean).join(' · ');
+            const groupKey = group.map(({ part, index }) => part.id || index).join('-');
+            return (
+              <ProcessGroupDetails
+                key={`process-${groupIndex}-${groupKey}`}
+                defaultOpen={processGroupsDefaultOpen}
+              >
+                <summary className="flex cursor-pointer list-none items-center gap-2 px-2.5 py-2 text-xs text-zinc-600 transition-colors hover:bg-zinc-50">
+                  <ListTree className="h-3.5 w-3.5 flex-shrink-0 text-zinc-400" />
+                  <span className="flex-shrink-0 font-semibold text-zinc-700">
+                    {t('chat.process.title', { count: group.length })}
+                  </span>
+                  {summary && (
+                    <span className="min-w-0 truncate text-zinc-500">
+                      {summary}
+                    </span>
+                  )}
+                  <ChevronDown className="ml-auto h-3 w-3 flex-shrink-0 text-zinc-400 transition-transform group-open/process:rotate-180" />
+                </summary>
+                <div className="border-t border-zinc-200/70 px-2.5 py-2">
+                  {group.map(({ part, index }) => renderPart(part, index))}
+                </div>
+              </ProcessGroupDetails>
+            );
+          };
+          const renderDisplayParts = () => {
+            if (!collapseIntermediateSteps || isUser) {
+              return displayParts.map(renderPart);
+            }
+            const nodes: React.ReactNode[] = [];
+            let processGroup: Array<{ part: MessagePart; index: number }> = [];
+            let processGroupIndex = 0;
+            const flushProcessGroup = () => {
+              if (processGroup.length === 0) return;
+              nodes.push(renderProcessGroup(processGroup, processGroupIndex));
+              processGroup = [];
+              processGroupIndex += 1;
+            };
+            displayParts.forEach((part, index) => {
+              if (isIntermediateProcessPart(part)) {
+                processGroup.push({ part, index });
+                return;
+              }
+              if (!isRenderableDisplayPart(part)) return;
+              flushProcessGroup();
+              nodes.push(renderPart(part, index));
+            });
+            flushProcessGroup();
+            return nodes;
+          };
           return (
             <>
               {fileParts.length > 0 && (
@@ -3041,104 +3984,12 @@ function ChatMessageBubbleInner({
                         <span className="truncate max-w-[240px]">{part.filename || 'file'}</span>
                       </div>
                     );
-                  })}
-                </div>
-              )}
-              {displayParts.map((part: MessagePart, i: number) => (
-                // Spacing between consecutive parts is owned by this wrapper,
-                // not by individual part components. Each part used to set its
-                // own `mt-2 first:mt-0`, but since every part lives in its own
-                // wrapper div, `first:` always matched and the gap collapsed
-                // to zero between, e.g., a tool card and the next thinking
-                // block, making them look glued together.
-                <div key={part.id || i} className="mt-2 first:mt-0">
-                  {/* Text */}
-                  {part.type === 'text' && part.text && (() => {
-                    const nodeRefMatch = isUser
-                      ? part.text.match(/^@@node:([^|\n]+)\|([^\n]+)\n([\s\S]*)$/)
-                      : null;
-                    const displayText = nodeRefMatch ? nodeRefMatch[3] : part.text;
-                    return (
-                      <>
-                        {nodeRefMatch && (
-                          <div className="flex items-center gap-1.5 mb-2 bg-gray-100 border border-gray-200 rounded-md px-2 py-1">
-                            <span className="w-1.5 h-1.5 rounded-full bg-gray-400 flex-shrink-0" />
-                            <code className="text-[10px] font-mono font-semibold text-gray-700 truncate">{nodeRefMatch[1]}</code>
-                            <span className="text-[9px] text-gray-500 flex-shrink-0">{nodeRefMatch[2]}</span>
-                          </div>
-                        )}
-                        <StreamingMarkdown
-                          content={displayText}
-                          isStreaming={isActive && !isUser}
-                        />
-                      </>
-                    );
-                  })()}
-
-                  {/* Tool call */}
-                  {part.type === 'tool' && (
-                    <ChatToolPart
-                      part={part}
-                      pendingQuestion={part.callID ? pendingQuestions?.[part.callID] : undefined}
-                      onAnswer={onQuestionAnswer && part.callID
-                        ? (answers) => onQuestionAnswer(part.callID!, pendingQuestions![part.callID!].requestId, answers)
-                        : undefined}
-                      onReject={onQuestionReject && part.callID
-                        ? () => onQuestionReject(part.callID!, pendingQuestions![part.callID!].requestId)
-                        : undefined}
-                    />
-                  )}
-
-                  {/* Reasoning / thinking */}
-                  {(part.type === 'reasoning' || part.type === 'thinking') && (part.text || part.thinking) && (() => {
-                    const thinkingText = part.text || part.thinking || '';
-                    const partKey = part.id || `reasoning-${i}`;
-                    const isExpanded = getPartExpanded(partKey);
-                    const isThinking = !isReasoningDone;
-                    return (
-                      // Vertical spacing is provided by the parent part wrapper
-                      // (see `otherParts.map` above); keep this container neutral
-                      // so wrapper-level `mt-2 first:mt-0` is the single source of
-                      // truth for inter-part gaps.
-                      <div>
-                        <button
-                          onClick={() => togglePart(partKey)}
-                          disabled={isThinking}
-                          className="group/think w-full text-left"
-                        >
-                          <div className={`flex items-center gap-2 px-2.5 py-1.5 rounded-md border text-xs transition-colors ${
-                            isThinking
-                              ? 'bg-sky-50 border-sky-100'
-                              : 'bg-zinc-50 border-zinc-200 hover:bg-zinc-100'
-                          }`}>
-                            {isThinking ? (
-                              <>
-                                <Brain className="w-3.5 h-3.5 flex-shrink-0 text-violet-500" />
-                                <span className="text-violet-600">{t('chat.thinking')}</span>
-                              </>
-                            ) : (
-                              <>
-                                <Brain className="w-3.5 h-3.5 flex-shrink-0 text-violet-500" />
-                                <span className="text-zinc-500 truncate min-w-0">
-                                  {thinkingText.slice(0, 80)}{thinkingText.length > 80 ? '…' : ''}
-                                </span>
-                                <ChevronDown className={`w-3 h-3 ml-auto text-zinc-400 flex-shrink-0 transition-transform ${isExpanded ? '' : '-rotate-90'}`} />
-                              </>
-                            )}
-                          </div>
-                        </button>
-                        {isExpanded && (
-                          <div className="mt-1 px-2.5 py-2 bg-zinc-50 rounded-md border border-zinc-200 text-[11px] text-zinc-500 whitespace-pre-wrap font-mono leading-relaxed max-h-52 overflow-y-auto">
-                            {thinkingText}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })()}
-                </div>
-              ))}
-            </>
-          );
+                    })}
+                  </div>
+                )}
+                {renderDisplayParts()}
+              </>
+            );
         })()
       )}
 
@@ -3256,14 +4107,62 @@ function ChatMessageBubbleInner({
   ) : null;
 
   if (isUser) {
+    if (!compact) {
+      return (
+        <div className="group relative flex w-full min-w-0 justify-end">
+          <div className={`flex min-w-0 flex-col items-end ${isEditing ? 'w-full' : 'max-w-[88%]'}`}>
+            {bubble}
+            {footer}
+          </div>
+          <div className="absolute -right-10 top-1">
+            {avatar}
+          </div>
+          {previewImage && (
+            <ImageLightbox
+              src={previewImage.url}
+              alt={previewImage.alt}
+              onClose={() => setPreviewImage(null)}
+            />
+          )}
+        </div>
+      );
+    }
+
     return (
-      <div className={`group relative ${!compact ? 'w-full' : ''} flex justify-end`}>
-        <div className={`relative flex flex-col items-end gap-2 ${messageGroupClass}`}>
+      <div className={`group relative ${!compact ? 'w-full' : ''} flex min-w-0 justify-end`}>
+        <div className={`flex min-w-0 items-start justify-end gap-2 ${messageGroupClass}`}>
+          <div className={`flex min-w-0 flex-col items-end ${isEditing ? 'w-full' : 'max-w-full'}`}>
+            {bubble}
+            {footer}
+          </div>
           <div className={getUserAvatarContainerClassName(compact)}>
             {avatar}
           </div>
-          <div aria-hidden="true" className={getUserAvatarSpacerClassName(compact)} />
-          <div className={`flex flex-col min-w-0 ${isEditing ? 'w-full' : 'w-fit max-w-full'}`}>
+        </div>
+        {previewImage && (
+          <ImageLightbox
+            src={previewImage.url}
+            alt={previewImage.alt}
+            onClose={() => setPreviewImage(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
+  if (!compact) {
+    return (
+      <div className="group relative flex w-full min-w-0">
+        <div className="absolute -left-10 top-1">
+          {avatar}
+        </div>
+        <div className="flex w-full min-w-0 flex-col items-start">
+          <div className={`flex items-center gap-2 ${headerHeight}`}>
+            <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+              {agentName}
+            </span>
+          </div>
+          <div className="flex w-full min-w-0 flex-col">
             {bubble}
             {footer}
           </div>
@@ -3280,12 +4179,12 @@ function ChatMessageBubbleInner({
   }
 
   return (
-    <div className={`group relative ${!compact ? 'w-full' : ''} flex`}>
+    <div className="group relative flex">
       <div className={`flex gap-2.5 ${messageGroupClass}`}>
         {avatar}
         <div className="flex flex-col items-start flex-1 min-w-0">
           <div className={`flex items-center gap-2 ${headerHeight}`}>
-            <span className="text-xs font-semibold text-zinc-700">
+            <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
               {agentName}
             </span>
           </div>
@@ -3333,6 +4232,7 @@ type TodoSummaryEntry = {
   status?: string;
   activeForm?: string;
 };
+type TodoTranslator = (key: string) => string;
 
 function isTodoSummaryEntry(value: unknown): value is TodoSummaryEntry {
   if (!value || typeof value !== 'object') return false;
@@ -3367,7 +4267,7 @@ function getTodoActionLabel(action: unknown): string {
   return 'Todos';
 }
 
-export function buildTodoSummary(state: Partial<ToolState>): string {
+export function buildTodoSummary(state: Partial<ToolState>, t?: TodoTranslator): string {
   const metadata = state.metadata ?? {};
   const currentTodos = pickTodoEntries(metadata.newTodos, metadata.todos, state.input?.todos);
   if (currentTodos.length === 0) return getTodoActionLabel(state.input?.action);
@@ -3381,42 +4281,80 @@ export function buildTodoSummary(state: Partial<ToolState>): string {
   let summary =
     terminalCount === totalCount
       ? hasCancelled
-        ? `Done ${terminalCount}/${totalCount}`
-        : `Completed ${terminalCount}/${totalCount}`
-      : `Progress ${terminalCount}/${totalCount}`;
+        ? `${t?.('chat.tool.todoSummary.done') ?? 'Done'} ${terminalCount}/${totalCount}`
+        : `${t?.('chat.tool.todoSummary.completed') ?? 'Completed'} ${terminalCount}/${totalCount}`
+      : `${t?.('chat.tool.todoSummary.progress') ?? 'Progress'} ${terminalCount}/${totalCount}`;
 
   if (inProgressCount > 0 && terminalCount < totalCount) {
-    summary += ` · In progress ${inProgressCount}`;
+    summary += ` · ${t?.('chat.tool.todoSummary.inProgress') ?? 'In progress'} ${inProgressCount}`;
   }
 
   return summary;
 }
 
-function todoStatusLabel(status: string | undefined): string {
+function todoStatusLabel(status: string | undefined, t: TodoTranslator): string {
   switch (status) {
     case 'completed':
-      return 'completed';
+      return t('chat.tool.todoStatus.completed');
     case 'in_progress':
-      return 'in progress';
+      return t('chat.tool.todoStatus.inProgress');
     case 'cancelled':
-      return 'cancelled';
+      return t('chat.tool.todoStatus.cancelled');
     case 'pending':
-      return 'pending';
+      return t('chat.tool.todoStatus.pending');
     default:
       return status || 'pending';
   }
 }
 
-function todoStatusClass(status: string | undefined): string {
+function todoStatusIcon(status: string | undefined): React.ReactNode {
   switch (status) {
     case 'completed':
-      return 'bg-emerald-50 text-emerald-700 border-emerald-100';
+      return (
+        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white">
+          <Check className="h-3 w-3" strokeWidth={3} />
+        </span>
+      );
     case 'in_progress':
-      return 'bg-sky-50 text-sky-700 border-sky-100';
+      return (
+        <span className="flex h-4 w-4 items-center justify-center rounded-full border border-sky-400 bg-white">
+          <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
+        </span>
+      );
     case 'cancelled':
-      return 'bg-zinc-100 text-zinc-500 border-zinc-200';
+      return (
+        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-200 text-zinc-500">
+          <X className="h-2.5 w-2.5" strokeWidth={2.5} />
+        </span>
+      );
     default:
-      return 'bg-amber-50 text-amber-700 border-amber-100';
+      return <span className="h-4 w-4 rounded-full border border-zinc-300 bg-white" />;
+  }
+}
+
+function todoTextClass(status: string | undefined): string {
+  switch (status) {
+    case 'completed':
+      return 'text-zinc-500';
+    case 'in_progress':
+      return 'font-medium text-zinc-800';
+    case 'cancelled':
+      return 'text-zinc-400 line-through decoration-zinc-300';
+    default:
+      return 'text-zinc-600';
+  }
+}
+
+function todoStatusLabelClass(status: string | undefined): string {
+  switch (status) {
+    case 'completed':
+      return 'text-emerald-600';
+    case 'in_progress':
+      return 'text-sky-600';
+    case 'cancelled':
+      return 'text-zinc-400';
+    default:
+      return 'text-zinc-400';
   }
 }
 
@@ -3440,15 +4378,15 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
   const state: Partial<ToolState> = part.state || {};
   const status = state.status || 'pending';
 
-  // Some tools block on an internal `question` call (for example safety
-  // confirmation inside `ssh_host_cmd`), so render the question UI whenever
-  // this running tool part has a pending question attached to it.
-  const isWaitingForAnswer = status === 'running' && !!pendingQuestion;
+  // Pending question state is the source of truth. Tool status can briefly
+  // arrive as completed after reconnects or transport races, but the user
+  // still needs the answer UI while the question request exists.
+  const isWaitingForAnswer = !!pendingQuestion;
 
   type StatusCfg = {
     icon: React.ReactNode;
     iconColor: string;
-    pill: string;      // 状态 pill 样式
+    pill: string;      // Status pill classes.
     label: string;
   };
   const statusConfig: Record<string, StatusCfg> = {
@@ -3489,18 +4427,22 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
     ? pickTodoEntries(state.metadata?.newTodos, state.metadata?.todos, state.input?.todos)
     : [];
   const showGenericToolPayload = toolName !== 'todo';
+  const isTodoTool = toolName === 'todo';
 
   // Reuse the shared helpers so the truncation rules stay in sync with the
   // delegate-task card and any other places that render tool input previews.
   const inputSummary = state.input
     ? truncateToolDisplayText(
         toolName === 'todo'
-          ? buildTodoSummary(state)
+          ? buildTodoSummary(state, t)
           : buildToolInputSummary(state.input),
       )
     : '';
   const displayTitle = state.title ? truncateToolDisplayText(state.title) : '';
   const workflowHeaderSummary = truncateToolDisplayText(buildRunWorkflowHeaderSummary(toolName, state, t));
+  const statusBadgeClass = isTodoTool
+    ? 'text-[11px] font-medium text-zinc-500'
+    : `text-[11px] font-medium px-1.5 py-0.5 rounded-md ${config.pill}`;
 
   if (isWaitingForAnswer) {
     // Outer spacing is owned by the part wrapper in SessionChat's parts map.
@@ -3551,7 +4493,7 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
           </div>
         </div>
         <div className="ml-auto flex items-center gap-1.5 flex-shrink-0 self-center">
-          <span className={`text-[11px] font-medium px-1.5 py-0.5 rounded-md ${config.pill}`}>
+          <span className={statusBadgeClass}>
             {config.label}
           </span>
           <ChevronDown className="w-3 h-3 text-zinc-400 transition-transform group-open/tool:rotate-180" />
@@ -3559,18 +4501,28 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
       </summary>
 
       <div className="border-t border-zinc-200/60 px-2.5 py-2 space-y-1.5 text-xs">
-        {toolName === 'todo' && todoEntries.length > 0 && (
-          <div className="rounded-md border border-zinc-200 bg-white/70 px-2 py-1.5">
-            <div className="mb-1.5 text-[11px] font-medium text-zinc-500">{t('chat.tool.todoStages')}</div>
-            <div className="space-y-1">
+        {isTodoTool && todoEntries.length > 0 && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-3 text-[11px] font-medium text-zinc-500">
+              <span>{t('chat.tool.todoStages')}</span>
+              <span className="font-normal text-zinc-400">{todoEntries.length}</span>
+            </div>
+            <div className="divide-y divide-zinc-100">
               {todoEntries.map((todo, index) => (
-                <div key={todo.id || index} className="flex items-start gap-2 text-[11px]">
-                  <span className="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-zinc-300" />
-                  <span className="min-w-0 flex-1 text-zinc-700">
+                <div
+                  key={todo.id || index}
+                  className="grid grid-cols-[16px_minmax(0,1fr)_auto] items-start gap-2 py-1.5 text-[11px] first:pt-0 last:pb-0"
+                >
+                  <span className="mt-0.5 flex h-4 w-4 flex-shrink-0 items-center justify-center">
+                    {todoStatusIcon(todo.status)}
+                  </span>
+                  <span className={`min-w-0 leading-5 ${todoTextClass(todo.status)}`}>
                     {todo.activeForm && todo.status === 'in_progress' ? todo.activeForm : todo.content}
                   </span>
-                  <span className={`flex-shrink-0 rounded-full border px-1.5 py-0.5 leading-none ${todoStatusClass(todo.status)}`}>
-                    {todoStatusLabel(todo.status)}
+                  <span
+                    className={`flex-shrink-0 whitespace-nowrap leading-5 ${todoStatusLabelClass(todo.status)}`}
+                  >
+                    {todoStatusLabel(todo.status, t)}
                   </span>
                 </div>
               ))}
@@ -3629,6 +4581,8 @@ export function ChatToolPart({ part, pendingQuestion, onAnswer, onReject }: Chat
 export const ChatMessageBubble = memo(ChatMessageBubbleInner, (prev, next) => {
   if (prev.isActive !== next.isActive) return false;
   if (prev.showActions !== next.showActions) return false;
+  if (prev.collapseIntermediateSteps !== next.collapseIntermediateSteps) return false;
+  if (prev.processGroupsDefaultOpen !== next.processGroupsDefaultOpen) return false;
   if (prev.editingMessageId !== next.editingMessageId) return false;
   if (prev.editingText !== next.editingText) return false;
   if (prev.actionsDisabled !== next.actionsDisabled) return false;

@@ -18,6 +18,11 @@ from flocks.auth.context import get_current_auth_user, set_current_auth_user, re
 from flocks.server.routes._timing import log_route_timing
 from flocks.audit import emit_audit_event
 from flocks.license import assert_license_active
+from flocks.session.context_usage import (
+    ContextUsageSnapshot,
+    build_context_usage_snapshot,
+    token_usage_to_dict,
+)
 from flocks.session.session import Session, SessionInfo as SessionModel
 from flocks.session.policy import SessionPolicy
 from flocks.utils.log import Log
@@ -91,6 +96,15 @@ class SessionTime(BaseModel):
     archived: Optional[int] = Field(None, description="Archive timestamp (ms)")
 
 
+class SessionGoalResponse(BaseModel):
+    """Persisted goal state shown by the WebUI composer banner."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: Literal["active", "paused", "completed", "blocked"] = Field(..., description="Goal status")
+    objective: str = Field(..., description="Goal objective")
+    reason: Optional[str] = Field(None, description="Last goal judge reason")
+
+
 class SessionResponse(BaseModel):
     """
     Session response - Flocks compatible
@@ -119,6 +133,7 @@ class SessionResponse(BaseModel):
     canWrite: bool = Field(False, description="Whether current user can continue this session")
     canDelete: bool = Field(False, description="Whether current user can delete this session")
     isShared: bool = Field(False, description="Whether this session is locally shared")
+    goal: Optional[SessionGoalResponse] = Field(None, description="Persisted session goal state")
 
 
 def _session_to_response(session: SessionModel) -> SessionResponse:
@@ -159,6 +174,26 @@ def _session_to_response(session: SessionModel) -> SessionResponse:
     )
 
 
+async def _session_to_response_with_goal(session: SessionModel) -> SessionResponse:
+    """Convert SessionModel to SessionResponse and attach persisted goal state."""
+    response = _session_to_response(session)
+    try:
+        from flocks.session.goal import GoalManager
+
+        goal_state = await GoalManager.get(session.id)
+    except Exception as exc:
+        log.warn("session.goal.response_error", {"sessionID": session.id, "error": str(exc)})
+        goal_state = None
+
+    if goal_state is not None:
+        response.goal = SessionGoalResponse(
+            status=goal_state.status,
+            objective=goal_state.objective,
+            reason=goal_state.last_reason or goal_state.paused_reason,
+        )
+    return response
+
+
 def _require_session_read_access(session: SessionModel, user) -> None:
     if not SessionPolicy.can_read(session, user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅会话所有者或受邀只读用户可访问会话")
@@ -167,6 +202,39 @@ def _require_session_read_access(session: SessionModel, user) -> None:
 def _require_session_write_access(session: SessionModel, user) -> None:
     if not SessionPolicy.can_write(session, user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅会话所有者可写，受邀用户为只读")
+
+
+async def _require_agent_usable_for_chat(agent_name: Optional[str]) -> None:
+    """Validate an explicitly requested chat agent.
+
+    The Agent page "enabled" toggle is stored as ``delegatable`` for backward
+    compatibility, but product semantics treat disabled subagents as unusable
+    from both delegation and direct chat selection.
+    """
+    if not agent_name:
+        return
+
+    from flocks.agent.registry import Agent
+
+    agent = await Agent.get(agent_name)
+    if agent is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Agent "{agent_name}" is not available',
+        )
+
+    tags = getattr(agent, "tags", None) or []
+    if getattr(agent, "hidden", False) or "system" in tags:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Agent "{agent_name}" is not available for chat',
+        )
+
+    if getattr(agent, "mode", None) != "primary" and getattr(agent, "delegatable", True) is False:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Agent "{agent_name}" is disabled',
+        )
 
 
 def _is_hidden_from_session_manager(session: SessionModel) -> bool:
@@ -194,6 +262,37 @@ async def _get_session_by_id_unfiltered(session_id: str) -> Optional[SessionMode
         return await Session.get_by_id(session_id)
     finally:
         reset_current_auth_user(token)
+
+
+async def _publish_context_usage_update(
+    event_publish_callback,
+    session_id: str,
+    *,
+    session: Optional[SessionModel] = None,
+    provider_id: Optional[str] = None,
+    model_id: Optional[str] = None,
+) -> None:
+    """Best-effort SSE update for the composer context-usage meter."""
+    if event_publish_callback is None:
+        return
+    try:
+        if session is None:
+            session = await _get_session_by_id_unfiltered(session_id)
+        snapshot = await build_context_usage_snapshot(
+            session_id,
+            session=session,
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+        await event_publish_callback(
+            "context.usage.updated",
+            snapshot.model_dump(by_alias=True),
+        )
+    except Exception as exc:
+        log.debug("session.context_usage.publish_failed", {
+            "sessionID": session_id,
+            "error": str(exc),
+        })
 
 
 # =============================================================================
@@ -277,7 +376,7 @@ async def list_sessions(
         if limit is not None and len(filtered) >= limit:
             break
     
-    response = [_session_to_response(s) for s in filtered]
+    response = [await _session_to_response_with_goal(s) for s in filtered]
     log_route_timing(log, "session.list.complete", started_at=started_at, extra={
         "count": len(response),
         "roots": roots,
@@ -382,7 +481,7 @@ async def create_session(http_request: Request, request: Optional[SessionCreateR
         )
     except Exception:
         pass
-    return _session_to_response(session)
+    return await _session_to_response_with_goal(session)
 
 
 
@@ -404,7 +503,26 @@ async def get_session(sessionID: str, request: Request) -> SessionResponse:
             detail=f"Session {sessionID} not found"
         )
     _require_session_read_access(session, _current_user)
-    return _session_to_response(session)
+    return await _session_to_response_with_goal(session)
+
+
+@router.get(
+    "/{sessionID}/context-usage",
+    response_model=ContextUsageSnapshot,
+    summary="Get session context usage",
+    description="Get the current context usage snapshot for the composer meter",
+)
+async def get_session_context_usage(sessionID: str, request: Request) -> ContextUsageSnapshot:
+    """Return current prompt/context usage for a session."""
+    current_user = require_user(request)
+    session = await _get_session_by_id_unfiltered(sessionID)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {sessionID} not found",
+        )
+    _require_session_read_access(session, current_user)
+    return await build_context_usage_snapshot(sessionID, session=session)
 
 
 @router.get(
@@ -424,7 +542,7 @@ async def get_session_children(sessionID: str, request: Request) -> List[Session
         )
     _require_session_read_access(session, current_user)
     children = await Session.children(session.project_id, sessionID)
-    return [_session_to_response(s) for s in children if SessionPolicy.can_read(s, current_user)]
+    return [await _session_to_response_with_goal(s) for s in children if SessionPolicy.can_read(s, current_user)]
 
 
 class TodoInfo(BaseModel):
@@ -615,7 +733,7 @@ async def update_session(
         )
     
     log.info("session.updated", {"session_id": sessionID})
-    return _session_to_response(session)
+    return await _session_to_response_with_goal(session)
 
 
 @router.post(
@@ -648,7 +766,7 @@ async def share_session_local(sessionID: str, http_request: Request) -> SessionR
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {sessionID} not found",
         )
-    return _session_to_response(session)
+    return await _session_to_response_with_goal(session)
 
 
 @router.post(
@@ -681,7 +799,7 @@ async def unshare_session_local(sessionID: str, http_request: Request) -> Sessio
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {sessionID} not found",
         )
-    return _session_to_response(session)
+    return await _session_to_response_with_goal(session)
 
 
 # =============================================================================
@@ -831,7 +949,7 @@ async def fork_session(sessionID: str, http_request: Request, request: Optional[
     forked = await Session.fork(session.project_id, sessionID, message_id)
     
     log.info("session.forked", {"from": sessionID, "to": forked.id})
-    return _session_to_response(forked)
+    return await _session_to_response_with_goal(forked)
 
 
 @router.get(
@@ -969,7 +1087,7 @@ async def revert_session(sessionID: str, request: RevertRequest, http_request: R
     )
     
     log.info("session.reverted", {"session_id": sessionID, "message_id": request.messageID})
-    return _session_to_response(updated)
+    return await _session_to_response_with_goal(updated)
 
 
 @router.post(
@@ -994,7 +1112,7 @@ async def unrevert_session(sessionID: str, http_request: Request) -> SessionResp
     updated = await SessionRevert.unrevert(session_id=sessionID)
     
     log.info("session.unreverted", {"session_id": sessionID})
-    return _session_to_response(updated)
+    return await _session_to_response_with_goal(updated)
 
 
 # =============================================================================
@@ -1051,6 +1169,7 @@ class PromptRequest(BaseModel):
     model: Optional[ModelInfo] = Field(None, description="Model selection")
     messageID: Optional[str] = Field(None, description="Message ID")
     agent: Optional[str] = Field(None, description="Agent name")
+    display_text: Optional[str] = Field(None, alias="displayText", description="User-visible message text")
     noReply: Optional[bool] = Field(None, description="Skip AI response")
     mockReply: Optional[str] = Field(None, description="Inject a mock assistant message after noReply user message")
     tools: Optional[Dict[str, bool]] = Field(None, description="Tool settings (deprecated)")
@@ -1692,10 +1811,12 @@ async def _run_existing_user_message(
     final_content = ""
     assistant_message_id = None
     created_ms = end_ms
+    final_tokens = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
 
     if result.last_message:
         assistant_message_id = result.last_message.id
         final_content = await Message.get_text_content(result.last_message)
+        final_tokens = token_usage_to_dict(getattr(result.last_message, "tokens", None))
         finish = getattr(result.last_message, "finish", None)
         if finish:
             finish_reason = finish
@@ -1724,10 +1845,17 @@ async def _run_existing_user_message(
             "agent": agent_name,
             "path": {"cwd": working_directory, "root": working_directory},
             "cost": 0,
-            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            "tokens": final_tokens,
             "finish": finish_reason,
         }
     })
+    await _publish_context_usage_update(
+        publish_event,
+        session_id,
+        session=session,
+        provider_id=provider_id,
+        model_id=model_id,
+    )
 
     log.info("session.message.replay.completed", {
         "sessionID": session_id,
@@ -2191,27 +2319,42 @@ async def _run_session_compaction(
                 "data": data,
             })
 
-    result = await run_compaction(
-        session_id,
-        parent_message_id=parent_message_id,
-        messages=messages,
-        provider_id=provider_id,
-        model_id=model_id,
-        auto=auto,
-        event_publish_callback=event_publish_callback,
-        status_after="idle",
-        focus_instruction=focus_instruction,
-        progress_callback=progress_callback,
-    )
+    async def publish_current_context_usage() -> None:
+        await _publish_context_usage_update(
+            event_publish_callback,
+            session_id,
+            session=session,
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+
+    try:
+        result = await run_compaction(
+            session_id,
+            parent_message_id=parent_message_id,
+            messages=messages,
+            provider_id=provider_id,
+            model_id=model_id,
+            auto=auto,
+            event_publish_callback=event_publish_callback,
+            status_after="idle",
+            focus_instruction=focus_instruction,
+            progress_callback=progress_callback,
+        )
+    except Exception:
+        await publish_current_context_usage()
+        raise
     if result == "stop":
         # ``SessionCompaction.process`` swallows the underlying provider
         # exception (so the loop path stays simple) but stashes the
         # user-facing message via ``_record_compaction_error``.  Surface
         # it verbatim here so the SSE ``session.error`` payload — and
-        # therefore the front-end toast — shows e.g. "Error code: 529
-        # — 模型服务暂时不可用" instead of an opaque "Compaction failed".
+        # therefore the front-end toast — shows the provider's original
+        # error text instead of an opaque "Compaction failed".
+        await publish_current_context_usage()
         detail = pop_last_compaction_error(session_id) or "Compaction failed"
         raise RuntimeError(detail)
+    await publish_current_context_usage()
     return agent_name, provider_id, model_id
 
 
@@ -2222,16 +2365,16 @@ _repair_json_string = repair_truncated_json
 
 def _check_session_aborted(sessionID: str, checkpoint: str, step: int, **extra_context) -> bool:
     """
-    检查 session 是否被 abort
+    Check whether the session has been aborted.
     
     Args:
         sessionID: Session ID
-        checkpoint: 检查点名称（如 "before_step", "in_stream", "skip_tool_processing"）
-        step: 当前 step 数
-        **extra_context: 额外的日志上下文信息
+        checkpoint: Checkpoint name, such as "before_step", "in_stream", or "skip_tool_processing".
+        step: Current step number.
+        **extra_context: Additional log context.
     
     Returns:
-        True 表示 session 已被 abort，应该停止执行
+        True when the session has been aborted and execution should stop.
     """
     from flocks.session.core.status import SessionStatus
     
@@ -2302,6 +2445,7 @@ async def _process_session_message(
     # ------------------------------------------------------------------
     # 2. Resolve agent and model (5-level priority)
     # ------------------------------------------------------------------
+    await _require_agent_usable_for_chat(request.agent)
     agent_name = request.agent or await Agent.default_agent()
     agent = await Agent.get(agent_name) or await Agent.get(DEFAULT_AGENT)
     
@@ -2350,22 +2494,23 @@ async def _process_session_message(
     user_message_id = request.messageID or Identifier.create("message")
     user_part_id = Identifier.create("part")
 
-    # display_text (optional) is the user-visible text shown in the chat bubble.
-    # It differs from text_content when a command generates a derived LLM prompt
-    # (e.g. "/tools create foo" stores the slash command text, not the full skill
-    # prompt that is sent to the LLM).
-    display_text = getattr(request, "display_text", None) or text_content
+    # display_text (optional) is UI-only. The stored text part must stay as the
+    # real prompt so SessionLoop, hooks, title generation, and queued prompts keep
+    # seeing the same content the model receives.
+    display_text = getattr(request, "display_text", None)
+    display_metadata = {"displayText": display_text} if display_text else None
 
     _is_no_reply = bool(request.noReply)
     user_message = await Message.create(
         session_id=sessionID,
         role=MessageRole.USER,
-        content=display_text,
+        content=text_content,
         id=user_message_id,
         time={"created": now_ms},
         agent=agent_name,
         model={"providerID": provider_id, "modelID": model_id},
         part_id=user_part_id,
+        part_metadata=display_metadata,
         synthetic=True if _is_no_reply else None,
     )
     user_message_id = user_message.id
@@ -2385,9 +2530,11 @@ async def _process_session_message(
         "messageID": user_message_id,
         "sessionID": sessionID,
         "type": "text",
-        "text": display_text,
+        "text": text_content,
         "time": {"start": now_ms},
     }
+    if display_metadata:
+        _part_event["metadata"] = display_metadata
     if _is_no_reply:
         _part_event["synthetic"] = True
     await publish_event("message.part.updated", {"part": _part_event})
@@ -2443,7 +2590,7 @@ async def _process_session_message(
             unique_name = f"{Identifier.create('part')}{ext}"
             target = uploads_root / unique_name
             target.write_bytes(raw_bytes)
-            return f"file://{target.resolve()}"
+            return target.resolve().as_uri()
         except Exception as exc:
             log.warn("session.message.file_part.materialize_failed", {
                 "sessionID": sessionID,
@@ -2533,6 +2680,14 @@ async def _process_session_message(
                 },
             })
 
+        await _publish_context_usage_update(
+            publish_event,
+            sessionID,
+            session=session,
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+
         return {
             "id": user_message_id,
             "sessionID": sessionID,
@@ -2589,10 +2744,12 @@ async def _process_session_message(
     finish_reason = "stop"
     final_content = ""
     assistant_message_id = None
+    final_tokens = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
     
     if result.last_message:
         assistant_message_id = result.last_message.id
         final_content = await Message.get_text_content(result.last_message)
+        final_tokens = token_usage_to_dict(getattr(result.last_message, "tokens", None))
         finish = getattr(result.last_message, 'finish', None)
         if finish:
             finish_reason = finish
@@ -2619,10 +2776,17 @@ async def _process_session_message(
             "agent": agent_name,
             "path": {"cwd": working_directory, "root": working_directory},
             "cost": 0,
-            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            "tokens": final_tokens,
             "finish": finish_reason,
         }
     })
+    await _publish_context_usage_update(
+        publish_event,
+        sessionID,
+        session=session,
+        provider_id=provider_id,
+        model_id=model_id,
+    )
     
     # Collect parts for the response
     all_parts = []
@@ -2803,13 +2967,21 @@ def _extract_text_from_parts(parts: List[Dict[str, Any]]) -> str:
     return "".join(part.get("text", "") for part in parts if part.get("type") == "text")
 
 
-def _replace_text_parts(parts: Optional[List[Dict[str, Any]]], text: str) -> List[Dict[str, Any]]:
+def _replace_text_parts(
+    parts: Optional[List[Dict[str, Any]]],
+    text: str,
+    text_metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     updated_parts: List[Dict[str, Any]] = []
     replaced = False
     for part in parts or []:
         if part.get("type") == "text" and not replaced:
             next_part = dict(part)
             next_part["text"] = text
+            if text_metadata:
+                merged_metadata = dict(next_part.get("metadata") or {})
+                merged_metadata.update(text_metadata)
+                next_part["metadata"] = merged_metadata
             updated_parts.append(next_part)
             replaced = True
             continue
@@ -2818,7 +2990,10 @@ def _replace_text_parts(parts: Optional[List[Dict[str, Any]]], text: str) -> Lis
         updated_parts.append(dict(part))
 
     if not replaced:
-        updated_parts.insert(0, {"type": "text", "text": text})
+        next_part: Dict[str, Any] = {"type": "text", "text": text}
+        if text_metadata:
+            next_part["metadata"] = dict(text_metadata)
+        updated_parts.insert(0, next_part)
     return updated_parts
 
 
@@ -2926,7 +3101,7 @@ def _materialize_data_url_part(
                 ext = "." + tail.lower()
         target = uploads_root / f"{Identifier.create('part')}{ext}"
         target.write_bytes(raw_bytes)
-        return f"file://{target.resolve()}"
+        return target.resolve().as_uri()
     except Exception as exc:
         log.warn("session.prompt_queue.materialize_failed", {
             "sessionID": session_id,
@@ -2946,7 +3121,7 @@ def _event_from_queued_prompt(item, working_directory: str):
         agent=item.agent,
         model=item.model,
         variant=item.variant,
-        display_text=None,
+        display_text=item.display_text,
         messageID=item.messageID,
         noReply=item.noReply,
         mockReply=item.mockReply,
@@ -3059,7 +3234,7 @@ def _build_prompt_request_from_event(event, prompt_text: str, display_text: Opti
     import types
 
     return types.SimpleNamespace(
-        parts=_replace_text_parts(event.parts, prompt_text),
+        parts=_replace_text_parts(event.parts, prompt_text, event.metadata or None),
         display_text=display_text,
         agent=event.agent,
         model=_coerce_model_for_prompt_request(event.model),
@@ -3174,6 +3349,13 @@ async def _dispatch_sse_input(sessionID: str, session, event, working_directory:
                 "time": {"start": asst_now, "end": asst_now},
             }
         })
+        await _publish_context_usage_update(
+            publish_event,
+            sessionID,
+            session=session,
+            provider_id="builtin",
+            model_id="command",
+        )
 
     async def _run_llm(output_event, prompt_text: str, display_text: Optional[str] = None) -> None:
         request = _build_prompt_request_from_event(output_event, prompt_text, display_text)
@@ -3219,7 +3401,18 @@ async def _dispatch_sse_input(sessionID: str, session, event, working_directory:
         session_control=_run_session_control,
         clear_history=_clear_history,
     )
-    await dispatch_user_input(event, sink)
+    result = await dispatch_user_input(event, sink)
+    if result.command_name == "goal" and result.action == "llm":
+        from flocks.session.goal import GoalManager
+
+        state = await GoalManager.get(sessionID)
+        if state is not None:
+            await publish_event("session.goal.updated", {
+                "sessionID": sessionID,
+                "status": state.status,
+                "objective": state.objective,
+                "reason": state.last_reason,
+            })
 
 
 class PromptQueueUpdateRequest(BaseModel):
@@ -3232,6 +3425,7 @@ async def _enqueue_prompt_request(
 ):
     from flocks.session.interaction_queue import InteractionQueue
 
+    await _require_agent_usable_for_chat(request.agent)
     model = request.model.model_dump(by_alias=True) if request.model else None
     parts = _materialize_queued_parts(session_id, [dict(part) for part in request.parts])
     return await InteractionQueue.enqueue(
@@ -3240,6 +3434,7 @@ async def _enqueue_prompt_request(
         agent=request.agent,
         model=model,
         variant=request.variant,
+        display_text=request.display_text,
         message_id=request.messageID,
         no_reply=request.noReply,
         mock_reply=request.mockReply,
@@ -3281,6 +3476,7 @@ async def enqueue_prompt(sessionID: str, request: PromptRequest) -> Dict[str, An
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {sessionID} not found",
         )
+    await _require_agent_usable_for_chat(request.agent)
     try:
         item = await _enqueue_prompt_request(sessionID, request)
     except QueueFullError as exc:
@@ -3392,6 +3588,7 @@ async def send_session_message_async(
         _require_session_write_access(session, current_user)
     
     working_directory = session.directory or os.getcwd()
+    await _require_agent_usable_for_chat(request.agent)
     
     log.info("session.prompt_async.accepted", {
         "sessionID": sessionID,
@@ -3406,7 +3603,7 @@ async def send_session_message_async(
         agent=request.agent,
         model=request.model.model_dump(by_alias=True) if request.model else None,
         variant=request.variant,
-        display_text=None,
+        display_text=request.display_text,
         messageID=request.messageID,
         noReply=request.noReply,
         mockReply=request.mockReply,
@@ -3441,6 +3638,7 @@ class CommandRequest(BaseModel):
     
     command: str = Field(..., description="Command name")
     arguments: str = Field("", description="Command arguments")
+    arguments_json: Optional[Any] = Field(None, alias="argumentsJson", description="Structured command arguments")
     messageID: Optional[str] = Field(None, description="Message ID")
     agent: Optional[str] = Field(None, description="Agent name")
     model: Optional[str] = Field(None, description="Model string (provider/model)")
@@ -3487,11 +3685,18 @@ async def send_session_command(sessionID: str, request: CommandRequest, http_req
         _require_session_write_access(session, current_user)
 
     working_directory = session.directory or os.getcwd()
+    await _require_agent_usable_for_chat(request.agent)
+    raw_arguments = request.arguments
+    if not raw_arguments and request.arguments_json is not None:
+        raw_arguments = json.dumps(request.arguments_json, ensure_ascii=False)
+    command_metadata: Dict[str, Any] = {}
+    if request.arguments_json is not None:
+        command_metadata["commandArgumentsJson"] = request.arguments_json
 
     # The text the user typed, shown verbatim in the chat bubble
     slash_text = f"/{request.command}"
-    if request.arguments:
-        slash_text += f" {request.arguments}"
+    if raw_arguments:
+        slash_text += f" {raw_arguments}"
 
     # ── Background task ──────────────────────────────────────────────────────
     async def _handle_command() -> None:
@@ -3503,6 +3708,7 @@ async def send_session_command(sessionID: str, request: CommandRequest, http_req
             agent=request.agent,
             model=request.model,
             variant=request.variant,
+            metadata=command_metadata,
             display_text=slash_text,
             messageID=request.messageID,
             working_directory=working_directory,
@@ -3740,11 +3946,16 @@ async def get_session_statistics(sessionID: str):
     - Model usage
     """
     try:
-        # Get session
-        session = await Session.load(sessionID)
-        
-        # Get messages
-        messages = await session.get_messages()
+        session = await _get_session_by_id_unfiltered(sessionID)
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {sessionID} not found",
+            )
+
+        from flocks.session.message import Message
+
+        messages = await Message.list_with_parts(sessionID, include_archived=True)
         
         # Calculate statistics
         message_count = len(messages)
@@ -3752,26 +3963,27 @@ async def get_session_statistics(sessionID: str):
         tool_call_count = 0
         model_usage = {}
         
-        for msg in messages:
+        for message_with_parts in messages:
+            msg = message_with_parts.info
+
             # Count tokens (approximate from parts)
-            for part in msg.parts:
-                if hasattr(part, 'text') and part.text:
+            for part in message_with_parts.parts:
+                if hasattr(part, "text") and part.text:
                     token_count += len(part.text.split())  # Rough approximation
                 
                 # Count tool calls
-                if hasattr(part, 'toolCall') and part.toolCall:
+                if getattr(part, "type", None) == "tool":
                     tool_call_count += 1
             
             # Track model usage
-            if msg.model:
-                model_usage[msg.model] = model_usage.get(msg.model, 0) + 1
-        
-        # Get session info
-        info = await session.get_info()
+            model = getattr(msg, "model", None)
+            if model:
+                model_key = model if isinstance(model, str) else json.dumps(model, sort_keys=True, default=str)
+                model_usage[model_key] = model_usage.get(model_key, 0) + 1
         
         # Calculate duration
-        created_ms = info.time.created
-        updated_ms = info.time.updated
+        created_ms = session.time.created
+        updated_ms = session.time.updated
         duration_ms = updated_ms - created_ms
         duration_seconds = duration_ms / 1000
         
@@ -3788,6 +4000,8 @@ async def get_session_statistics(sessionID: str):
         
         log.info("session.statistics", {"sessionID": sessionID, "messages": message_count})
         return stats
+    except HTTPException:
+        raise
     except Exception as e:
         log.error("session.statistics.error", {"sessionID": sessionID, "error": str(e)})
         raise HTTPException(status_code=500, detail=f"Failed to get session statistics: {str(e)}")
@@ -3803,11 +4017,13 @@ async def _clear_session_history(sessionID: str) -> int:
         )
 
     from flocks.server.routes.event import publish_event
+    from flocks.session.goal import GoalManager
     from flocks.session.interaction_queue import InteractionQueue
     from flocks.session.message import Message
 
     await abort_session(sessionID)
     await InteractionQueue.clear(sessionID)
+    await GoalManager.clear(sessionID)
     try:
         await _publish_prompt_queue(sessionID)
     except Exception as exc:

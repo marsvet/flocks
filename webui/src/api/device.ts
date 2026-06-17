@@ -91,6 +91,8 @@ export interface DeviceTestResult {
 }
 
 export interface DeviceTestRequest {
+  /** Unsaved form fields used only for this probe. */
+  fields?: Record<string, string>;
   /** Override the persisted base_url for this probe only (typically the
    *  current value in the form, before it has been saved). */
   base_url?: string;
@@ -172,6 +174,9 @@ export const deviceAPI = {
 
   listTemplates: (params?: { refresh?: boolean }) =>
     client.get<DeviceTemplate[]>('/api/devices/templates', { params }),
+
+  sync: (params?: { refresh?: boolean }) =>
+    client.post<{ created: number }>('/api/devices/sync', null, { params }),
 
   createCustomTemplate: (data: CustomDeviceTemplateCreate) =>
     client.post<DeviceTemplate>('/api/devices/templates/custom', data),

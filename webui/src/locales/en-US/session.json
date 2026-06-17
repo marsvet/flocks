@@ -85,6 +85,34 @@
     "stopTitle": "Stop execution",
     "contextUsageTitle": "Context used: {{used}} / {{total}} ({{percent}}%)",
     "contextUsageUnknown": "Context usage unknown",
+    "contextUsage": {
+      "title": "Context Usage",
+      "close": "Close",
+      "full": "{{percent}}% Full",
+      "tokens": "~{{used}} / {{total}} Tokens",
+      "excludedTokens": "{{tokens}} excluded",
+      "noAttributedSegments": "No attributed breakdown",
+      "breakdown": {
+        "systemPrompt": "System prompt",
+        "toolDefinitions": "Tool definitions",
+        "tools": "Tool calls",
+        "skillLoad": "Skill loads",
+        "agentDelegation": "Agent delegation",
+        "conversation": "Conversation",
+        "reasoning": "Reasoning",
+        "draft": "Current draft",
+        "compactedHistory": "Compacted history"
+      }
+    },
+    "goal": {
+      "dismiss": "Dismiss goal notice",
+      "status": {
+        "active": "Goal",
+        "completed": "Completed",
+        "blocked": "Blocked",
+        "paused": "Paused"
+      }
+    },
     "edit": "Edit",
     "editRawHint": "You are editing the original unrendered content. Saving updates the raw message text directly.",
     "editRawTitle": "Edit raw content",
@@ -96,6 +124,11 @@
     "regenerate": "Regenerate",
     "thinking": "Thinking...",
     "streaming": "Streaming...",
+    "process": {
+      "title": "Process ({{count}})",
+      "reasoningCount": "{{count}} reasoning",
+      "toolCount": "{{count}} tool calls"
+    },
     "you": "You",
     "sending": "Sending...",
     "contextCompressed": "Context compressed",
@@ -160,10 +193,24 @@
       "inputParams": "Input Parameters",
       "outputResult": "Output Result",
       "todoStages": "Todo stages",
+      "todoStatus": {
+        "pending": "pending",
+        "inProgress": "in progress",
+        "completed": "completed",
+        "cancelled": "cancelled"
+      },
+      "todoSummary": {
+        "progress": "Progress",
+        "inProgress": "In progress",
+        "completed": "Completed",
+        "done": "Done"
+      },
       "errorLabel": "Error",
       "elapsed": "Elapsed",
       "workflowStage": "Current stage: {{phase}}",
       "workflowNode": "Node: {{node}}",
+      "workflowLoopIteration": "Loop",
+      "workflowLoopCurrent": "Current",
       "workflowStep": "Step: {{step}}",
       "workflowPhase": {
         "queued": "Queued",

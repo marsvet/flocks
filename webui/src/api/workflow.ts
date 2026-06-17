@@ -163,6 +163,7 @@ export interface WorkflowTriggerPlugin {
 export interface WorkflowJSON {
   version?: string;
   name?: string;
+  nameI18n?: Record<string, string>;
   start: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
@@ -173,8 +174,10 @@ export interface WorkflowJSON {
 export interface Workflow {
   id: string;
   name: string;
+  nameI18n?: Record<string, string>;
   description?: string;
   markdownContent?: string;
+  editMarkdownContent?: string;
   category: string;
   workflowJson: WorkflowJSON;
   status: 'draft' | 'active' | 'archived';
@@ -225,6 +228,18 @@ export interface WorkflowExecution {
   currentNodeType?: string;
   currentPhase?: string;
   currentStepIndex?: number;
+  stepCount?: number;
+  stepLogOffset?: number;
+  stepLogLimit?: number;
+  stepLogTotal?: number;
+  loopProgress?: {
+    loop_node_id?: string;
+    iteration?: number;
+    total_iterations?: number;
+    current_item?: string;
+    current_inner_node_id?: string;
+    global_step_index?: number;
+  };
 }
 
 export interface WorkflowNodeExecution {
@@ -250,6 +265,35 @@ export interface WorkflowService {
 }
 
 export type WorkflowServiceDriver = 'local' | 'docker';
+
+export interface WorkflowIntegrationConfig {
+  version: number;
+  kind: string;
+  workflow: {
+    id: string;
+    name?: string;
+    category?: string;
+    source?: string;
+  };
+  updatedAt: number;
+  publish: Record<string, any>;
+  triggers: WorkflowTrigger[];
+  [key: string]: any;
+}
+
+export interface WorkflowIntegrationConfigResponse {
+  ok?: boolean;
+  exists?: boolean;
+  path: string;
+  storageKey?: string;
+  source?: 'storage' | 'file_migrated' | 'generated' | string;
+  config: WorkflowIntegrationConfig;
+  runtime?: {
+    publish?: Record<string, any>;
+    triggers?: WorkflowTriggerRecord[];
+    [key: string]: any;
+  };
+}
 
 /** Saved syslog listener config (per workflow). */
 export interface SyslogConfig {
@@ -303,6 +347,7 @@ export interface WorkflowPollerConfig {
   workflowId?: string;
   enabled?: boolean;
   intervalSeconds?: number;
+  cronExpression?: string | null;
   timeoutSeconds?: number;
   noOverlap?: boolean;
   inputs?: Record<string, any>;
@@ -353,6 +398,8 @@ export const workflowAPI = {
     description?: string;
     category?: string;
     workflowJson?: WorkflowJSON;
+    markdownContent?: string;
+    editMarkdownContent?: string;
     status?: 'draft' | 'active' | 'archived';
   }) =>
     client.put<Workflow>(`/api/workflow/${id}`, data),
@@ -373,8 +420,12 @@ export const workflowAPI = {
   getHistory: (id: string, params?: { limit?: number; triggerId?: string; triggerType?: string }) =>
     client.get<WorkflowExecution[]>(`/api/workflow/${id}/history`, { params }),
   
-  getExecution: (workflowId: string, execId: string) =>
-    client.get<WorkflowExecution>(`/api/workflow/${workflowId}/history/${execId}`),
+  getExecution: (
+    workflowId: string,
+    execId: string,
+    params?: { stepOffset?: number; stepLimit?: number },
+  ) =>
+    client.get<WorkflowExecution>(`/api/workflow/${workflowId}/history/${execId}`, { params }),
 
   cancelExecution: (workflowId: string, execId: string) =>
     client.post<{ status: string; message: string; executionId: string }>(
@@ -394,13 +445,25 @@ export const workflowAPI = {
     client.get<WorkflowJSON>(`/api/workflow/${id}/export`),
 
   publish: (id: string, data?: { driver?: WorkflowServiceDriver }) =>
-    client.post<WorkflowService>(`/api/workflow/${id}/publish`, data, { timeout: 300000 }),
+    client.post<WorkflowService>(`/api/workflow/${id}/publish`, data, { timeout: 600000 }),
 
   unpublish: (id: string) =>
     client.post<{ ok: boolean }>(`/api/workflow/${id}/unpublish`),
 
   getService: (id: string) =>
     client.get<WorkflowService | null>(`/api/workflow/${id}/service`),
+
+  deleteService: (id: string) =>
+    client.delete<{ ok: boolean; workflowId: string }>(`/api/workflow/${id}/service`),
+
+  getConfig: (id: string) =>
+    client.get<WorkflowIntegrationConfigResponse>(`/api/workflow/${id}/config`),
+
+  updateConfig: (id: string, config: WorkflowIntegrationConfig) =>
+    client.put<WorkflowIntegrationConfigResponse>(`/api/workflow/${id}/config`, config),
+
+  syncConfig: (id: string) =>
+    client.post<WorkflowIntegrationConfigResponse>(`/api/workflow/${id}/config/sync`),
 
   listServices: () =>
     client.get<WorkflowService[]>('/api/workflow-services'),
@@ -508,3 +571,43 @@ export const workflowAPI = {
   saveSampleInputs: (id: string, sampleInputs: Record<string, any>) =>
     client.post<{ ok: boolean }>(`/api/workflow/${id}/sample-inputs`, { sampleInputs }),
 };
+
+export function workflowAPIEndpoints(id: string, triggerId = '{triggerId}') {
+  const workflowBase = `/api/workflow/${id}`;
+  const triggerBase = `${workflowBase}/triggers`;
+  const triggerRecord = `${triggerBase}/${triggerId}`;
+
+  return {
+    config: {
+      read: `GET ${workflowBase}/config`,
+      write: `PUT ${workflowBase}/config`,
+      syncFallback: `POST ${workflowBase}/config/sync`,
+    },
+    apiService: {
+      read: `GET ${workflowBase}/service`,
+      publish: `POST ${workflowBase}/publish`,
+      unpublish: `POST ${workflowBase}/unpublish`,
+      delete: `DELETE ${workflowBase}/service`,
+    },
+    triggers: {
+      list: `GET ${triggerBase}`,
+      create: `POST ${triggerBase}`,
+      update: `PUT ${triggerRecord}`,
+      delete: `DELETE ${triggerRecord}`,
+      status: `GET ${triggerRecord}/status`,
+      previewMapping: `POST ${triggerRecord}/preview-mapping`,
+      test: `POST ${triggerRecord}/test`,
+      invokeWebhook: `/webhook/workflows/${id}/${triggerId}`,
+      plugins: 'GET /api/workflow-trigger-plugins',
+    },
+    legacyAdapters: {
+      kafkaConfig: `GET/POST ${workflowBase}/kafka-config`,
+      kafkaStatus: `GET ${workflowBase}/kafka-status`,
+      pollerConfig: `GET/POST ${workflowBase}/poller-config`,
+      pollerStatus: `GET ${workflowBase}/poller-status`,
+      pollerRunOnce: `POST ${workflowBase}/poller-run-once`,
+      syslogConfig: `GET/POST ${workflowBase}/syslog-config`,
+      syslogStatus: `GET ${workflowBase}/syslog-status`,
+    },
+  };
+}
